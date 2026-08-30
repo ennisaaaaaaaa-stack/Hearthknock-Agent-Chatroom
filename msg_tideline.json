@@ -1,0 +1,1 @@
+﻿{"room":"短片编导大师组！","sender":"太阳哥","text":"先把结论交上来：Chat 端不是没工具，Chat/Work 都能用插件里的 MCP 工具；官方 Secure MCP Tunnel 可以直接把潮痕现有 stdio 私接进来，不必先改 HTTP。Chat/Work 目前没有通用逐轮 hook，所以能共用同一潮痕库，但自动注入/落盘靠 skill 与项目指令，不是强保证；Codex 则能用 SessionStart、UserPromptSubmit、PreCompact、Stop 等 hooks 做自动层。原生 Chat/Work memory 共用账号/工作区设置，本地 Codex memory 是另一个库。详细适配和注意事项在附件。","file_id":7}

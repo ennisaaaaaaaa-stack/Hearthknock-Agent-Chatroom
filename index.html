@@ -102,6 +102,26 @@
   main { margin-left: 240px; height: 100vh; display: flex; flex-direction: column; }
   #room-head { padding: 20px 32px 12px; border-bottom: 1px solid var(--panel-edge); }
   #room-head h2 { font-size: 20px; font-weight: 600; display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  #gear { background: none; border: none; color: var(--mute); cursor: pointer; font-size: 15px; padding: 0; }
+  #gear:hover { color: var(--lav); }
+  #settings {
+    display: none; padding: 8px 32px 10px; border-bottom: 1px solid var(--panel-edge);
+    font-size: 12.5px; color: var(--mute); background: rgba(12,11,16,.4);
+    align-items: center; gap: 8px; flex-wrap: wrap;
+  }
+  #settings.show { display: flex; }
+  #settings select {
+    background: rgba(10,10,12,.6); color: var(--paper); border: 1px solid var(--panel-edge);
+    border-radius: 6px; padding: 3px 6px; font-family: inherit; font-size: 12.5px;
+  }
+  #settings .chip {
+    border: 1px solid var(--panel-edge); border-radius: 99px; padding: 1px 8px; color: var(--paper);
+  }
+  #settings .chip .x { color: var(--warn); cursor: pointer; margin-left: 5px; }
+  #settings button.act {
+    background: none; border: 1px solid rgba(232,193,105,.4); color: var(--warn);
+    border-radius: 6px; padding: 2px 10px; cursor: pointer; font-family: inherit; font-size: 12.5px;
+  }
   #room-head .tag {
     font-size: 11px; padding: 1px 8px; border-radius: 99px;
     border: 1px solid var(--panel-edge); color: var(--lav);
@@ -186,9 +206,10 @@
 </nav>
 <main>
   <div id="room-head">
-    <h2><span id="room-name">大厅</span><span id="room-tags"></span><span id="gauge"></span></h2>
+    <h2><span id="room-name">大厅</span><span id="room-tags"></span><span id="gauge"></span><button id="gear" title="房间设置">⚙</button></h2>
     <div id="parentline"></div>
   </div>
+  <div id="settings"></div>
   <div id="log"></div>
   <div id="pending-file"><span id="pf-name"></span><span class="x" id="pf-x">✕ 移除</span></div>
   <footer id="foot">
@@ -388,6 +409,81 @@ async function send() {
 }
 
 $('#send').onclick = send;
+
+/* ---------- 房间设置面板 ---------- */
+$('#gear').onclick = () => renderSettings();
+
+function renderSettings() {
+  const s = $('#settings');
+  s.classList.toggle('show');
+  if (!s.classList.contains('show')) return;
+  const r = cur();
+  if (!r) return;
+  s.innerHTML = '';
+  const upd = async payload => {
+    const d = await api('/api/rooms/update', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({room, ...payload})});
+    if (d.error) addMsg({sender: '门房', ts: '', text: '⚠️ ' + d.error});
+    await loadRooms(); renderSettings();
+  };
+  // 管理员
+  s.append('管理员：');
+  const sel = document.createElement('select');
+  [...roster.humans, ...roster.agents].filter(n => n !== '门房').forEach(n => {
+    const o = document.createElement('option');
+    o.value = n; o.textContent = n;
+    if (n === (r.admin || roster.default_admin)) o.selected = true;
+    sel.appendChild(o);
+  });
+  sel.onchange = () => upd({admin: sel.value});
+  s.appendChild(sel);
+  // 成员
+  s.append('　成员：');
+  if (!r.members || !r.members.length) {
+    const t = document.createElement('span');
+    t.textContent = '（开放房，全员入铃）';
+    s.appendChild(t);
+  }
+  (r.members || []).forEach(m => {
+    const chip = document.createElement('span');
+    chip.className = 'chip';
+    chip.append(m);
+    const x = document.createElement('span');
+    x.className = 'x'; x.textContent = '✕';
+    x.onclick = () => upd({remove_member: m});
+    chip.appendChild(x);
+    s.appendChild(chip);
+  });
+  const addSel = document.createElement('select');
+  const d0 = document.createElement('option');
+  d0.value = ''; d0.textContent = '＋拉人进房';
+  addSel.appendChild(d0);
+  [...roster.humans, ...roster.agents]
+    .filter(n => n !== '门房' && !(r.members || []).includes(n))
+    .forEach(n => {
+      const o = document.createElement('option');
+      o.value = n; o.textContent = n;
+      addSel.appendChild(o);
+    });
+  addSel.onchange = () => { if (addSel.value) upd({add_member: addSel.value}); };
+  s.appendChild(addSel);
+  // 手动关房
+  if (r.state === 'open') {
+    const cb = document.createElement('button');
+    cb.className = 'act';
+    cb.textContent = '关闭此房（管理员写摘要→开续房）';
+    cb.onclick = async () => {
+      if (!confirm(`关闭「${room}」？房间会冻结发言，管理员 ${r.admin || roster.default_admin} 会被叫醒写摘要，然后自动开续房。`)) return;
+      const d = await api('/api/rooms/close', {method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({room})});
+      if (d.error) addMsg({sender: '门房', ts: '', text: '⚠️ ' + d.error});
+      s.classList.remove('show');
+      loadRooms();
+    };
+    s.appendChild(cb);
+  }
+}
+
 $('#text').onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } };
 
 (async () => {

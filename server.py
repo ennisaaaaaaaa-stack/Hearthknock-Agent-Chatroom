@@ -179,6 +179,10 @@ class H(BaseHTTPRequestHandler):
                 return self._create_room()
             elif path == "/api/rooms/join":
                 return self._join()
+            elif path == "/api/rooms/update":
+                return self._update_room()
+            elif path == "/api/rooms/close":
+                return self._close_room()
             elif path == "/api/rooms/summary":
                 return self._submit_summary()
             self._json({"error": "not found"}, 404)
@@ -266,6 +270,43 @@ class H(BaseHTTPRequestHandler):
                 c.execute("UPDATE rooms SET members=? WHERE room=?",
                           (json.dumps(r["members"], ensure_ascii=False), room))
         self._json({"ok": True})
+
+    def _update_room(self):
+        # 房间设置：换管理员、增/删成员。家庭信任模型，不做权限。
+        data = self._body()
+        room = (data.get("room") or "").strip()
+        with _lock, db() as c:
+            r = get_room(c, room)
+            if not r:
+                return self._json({"error": "no such room"}, 404)
+            admin = (data.get("admin") or "").strip()
+            if admin:
+                c.execute("UPDATE rooms SET admin=? WHERE room=?", (admin, room))
+            add = (data.get("add_member") or "").strip()
+            if add and add not in r["members"]:
+                r["members"].append(add)
+                c.execute("UPDATE rooms SET members=? WHERE room=?",
+                          (json.dumps(r["members"], ensure_ascii=False), room))
+            rem = (data.get("remove_member") or "").strip()
+            if rem and rem in r["members"]:
+                r["members"].remove(rem)
+                c.execute("UPDATE rooms SET members=? WHERE room=?",
+                          (json.dumps(r["members"], ensure_ascii=False), room))
+        self._json({"ok": True})
+
+    def _close_room(self):
+        # 手动触发关房流程：state -> closing，门房会去叫管理员写摘要
+        data = self._body()
+        room = (data.get("room") or "").strip()
+        with _lock, db() as c:
+            r = get_room(c, room)
+            if not r:
+                return self._json({"error": "no such room"}, 404)
+            if r["state"] != "open":
+                return self._json({"error": f"房间已是 {r['state']}"}, 409)
+            c.execute("UPDATE rooms SET state='closing', admin=COALESCE(admin, ?) WHERE room=?",
+                      (default_admin(), room))
+        self._json({"ok": True, "closing": room})
 
     def _submit_summary(self):
         data = self._body()
