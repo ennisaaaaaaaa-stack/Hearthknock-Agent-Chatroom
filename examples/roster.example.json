@@ -1,0 +1,6 @@
+{
+  "humans": ["human"],
+  "agents": ["agent-a", "agent-b", "门房"],
+  "default_admin": "agent-a",
+  "note": "members 为空的房间 = 开放房（全员可入铃）；门房登记在 agents 里是为了防循环闸——系统消息不算人类发言"
+}

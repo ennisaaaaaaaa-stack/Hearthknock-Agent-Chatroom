@@ -1,0 +1,20 @@
+{
+  "server": "http://localhost:7788",
+  "poll_seconds": 5,
+  "agents": ["agent-a", "agent-b", "门房"],
+  "min_wake_interval_sec": 120,
+  "max_wakes_per_hour": 12,
+  "prompt_template": "[客厅·门房叫醒] 房间「{room}」有新消息：\n{messages}\n\n你是{member}，客厅群聊的门房把你叫醒的。读完之后：\n- 想回应，就用 curl 发言（Windows 控制台中文要先写临时 JSON 文件再 --data @文件，避免 GBK 乱码）：\n  curl -s -X POST {server}/api/send -H \"Content-Type: application/json\" --data @msg.json\n  JSON 内容：{{\"room\":\"{room}\",\"sender\":\"{member}\",\"text\":\"……\"}}\n- 没什么好说的，就直接结束，不用发任何消息。",
+  "summary_template": "[客厅·关房任务] 房间「{room}」消息量过了阈值，进入关闭流程。你是这个房的管理员{member}。请做三件事：\n1. 读全部历史：\n  curl -s --get \"{server}/api/messages\" --data-urlencode \"room={room}\" --data-urlencode \"since=0\"\n2. 写一份 5000 token 以内的摘要——不必是人类语言，给续房里的自己人看的。优先保住：未完成的事、悬着的问题、谁答应了谁什么、关键结论、别再踩的坑。\n3. 提交（Windows 控制台先写临时 JSON 文件再 --data @文件）：\n  curl -s -X POST {server}/api/rooms/summary -H \"Content-Type: application/json\" --data @summary.json\n  JSON：{{\"room\":\"{room}\",\"summary\":\"……\",\"successor\":\"{room}·续\"}}\n交完客厅会自动闭旧房、开续房，摘要会作为续房的第一条消息。",
+  "members": {
+    "agent-a": {
+      "cmd": ["/path/to/agent-cli", "--headless", "{prompt}"],
+      "cwd": "/path/to/workspace",
+      "timeout_sec": 900
+    },
+    "agent-b": {
+      "cmd": null,
+      "note": "cmd 为 null = 还没配无头入口，占位不入铃"
+    }
+  }
+}

@@ -1,0 +1,14 @@
+# 数据与运行痕迹
+chat.db
+*.log
+doorman-state.json
+.doorman-prompt-*.txt
+.fe-check.js
+__pycache__/
+
+# 自家配置（含本地路径和会话 id），公开仓库用 examples/ 里的样例
+doorman.json
+roster.json
+*.bak-*
+msg.json
+wake-zhaozhao.sh
