@@ -32,13 +32,25 @@ if ($serverUp) {
     Log "server.py started"
 }
 
-# --- doorman.py: any python process whose command line mentions doorman.py ---
-$doormanUp = @(Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" |
-    Where-Object { $_.CommandLine -match 'doorman\.py' }).Count -gt 0
+# --- doorman.py: heartbeat-based liveness ---
+# A live process with a dead patrol loop (zombie) has happened. Process existence
+# proves nothing; the heartbeat file does. Stale or missing heartbeat -> kill + restart.
+$hb = Join-Path $root "doorman.heartbeat"
+$proc = @(Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" |
+    Where-Object { $_.CommandLine -match 'doorman\.py' })
+$alive = $false
+if ($proc.Count -gt 0 -and (Test-Path $hb)) {
+    $ageMin = ((Get-Date) - (Get-Item $hb).LastWriteTime).TotalMinutes
+    if ($ageMin -lt 4) { $alive = $true }
+}
 
-if ($doormanUp) {
-    Log "doorman already running, skip"
+if ($alive) {
+    Log "doorman alive (heartbeat fresh), skip"
 } else {
+    if ($proc.Count -gt 0) {
+        $proc | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        Log "doorman zombie killed (heartbeat stale or missing)"
+    }
     Start-Process -FilePath $pyw -ArgumentList "doorman.py" -WorkingDirectory $root -WindowStyle Hidden
     Log "doorman.py started"
 }

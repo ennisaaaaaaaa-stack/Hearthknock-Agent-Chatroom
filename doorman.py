@@ -35,16 +35,18 @@ except Exception:
 BASE = Path(__file__).parent
 LOG = BASE / "doorman.log"
 STATE_FILE = BASE / "doorman-state.json"
+HB = BASE / "doorman.heartbeat"
 WAKE_LOCKS = {}
 
 
 def load_cfg():
-    global LOG, STATE_FILE
+    global LOG, STATE_FILE, HB
     path = BASE / "doorman.json"
     if "--config" in sys.argv:
         path = Path(sys.argv[sys.argv.index("--config") + 1]).resolve()
         LOG = path.parent / "doorman.log"
         STATE_FILE = path.parent / "doorman-state.json"
+        HB = path.parent / "doorman.heartbeat"
     return json.loads(path.read_text(encoding="utf-8"))
 
 
@@ -133,6 +135,86 @@ def due(state, member, cfg, now):
     return len(wakes) < cfg["max_wakes_per_hour"]
 
 
+def patrol(cfg, agents, state, now):
+    """巡一轮所有房。返回是否有状态变更。任何单个房间的错都不该炸掉整轮。"""
+    dirty = False
+    try:
+        rooms = fetch_rooms(cfg["server"])
+    except Exception as e:
+        log(f"拉房间列表失败: {e}")
+        return False
+    for r in rooms:
+        room, members, rstate = r["room"], r["members"], r["state"]
+        if rstate == "closed":
+            continue
+        if rstate == "closing":
+            # 每个房只通知一次；admin 没配无头入口就记账等人来救
+            if room in state["closing_notified"]:
+                continue
+            admin = r["admin"] or "mingming"
+            spec = cfg["members"].get(admin)
+            if spec and spec.get("cmd"):
+                state["closing_notified"].append(room)
+                dirty = True
+                log(f"「{room}」进入关闭流程，通知管理员 {admin}")
+                threading.Thread(target=wake, args=(cfg, admin, room),
+                                 kwargs={"closing": True},
+                                 daemon=True, name=f"close-{room}").start()
+            else:
+                state["closing_notified"].append(room)
+                dirty = True
+                log(f"「{room}」进入关闭流程，但管理员 {admin} 没有无头入口，挂了账")
+            continue
+        # open 房：扫新消息
+        if room not in state["cursors"]:
+            d = fetch_messages(cfg["server"], room, 0)
+            state["cursors"][room] = d["cursor"]
+            dirty = True
+            log(f"房间「{room}」游标初始化到 {d['cursor']}（积压 {len(d['messages'])} 条不追）")
+            continue
+        try:
+            d = fetch_messages(cfg["server"], room, state["cursors"][room])
+        except Exception as e:
+            log(f"巡「{room}」失败: {e}")
+            continue
+        msgs = d["messages"]
+        if not msgs:
+            continue
+        state["cursors"][room] = d["cursor"]
+        dirty = True
+        log(f"「{room}」来了 {len(msgs)} 条新消息（{', '.join(m['sender'] for m in msgs)}）")
+        for member, spec in cfg["members"].items():
+            if not spec.get("cmd"):
+                continue  # 还没配上无头入口的成员
+            mine = [m for m in msgs if m["sender"] != member]
+            if not mine:
+                continue
+            mentioned = any(f"@{member}" in m["text"] for m in mine)
+            if members and member not in members:
+                # 限定房：非成员不旁听；被 @ = 邀请，拉进房再叫醒
+                if not mentioned:
+                    continue
+                try:
+                    post_json(cfg["server"], "/api/rooms/join", {"room": room, "member": member})
+                    log(f"{member} 被 @ 邀请进「{room}」")
+                except Exception as e:
+                    log(f"拉 {member} 进「{room}」失败: {e}")
+            human_spoke = any(m["sender"] not in agents for m in mine)
+            if not (human_spoke or mentioned):
+                continue
+            # 人类发言必须送达；节流只限制 agent 之间的 @ 唤醒。
+            # 同一成员的并发由 wake() 里的锁串行化。
+            if not human_spoke and not due(state, member, cfg, now):
+                log(f"{member} 该叫但被节流按住（间隔/时额）")
+                continue
+            state["last_wake"][member] = now
+            state["wake_log"].setdefault(member, []).append(now)
+            # 并行叫醒：一个成员慢（冷启动约 1 分钟）不挡别人的门铃
+            threading.Thread(target=wake, args=(cfg, member, room, mine),
+                             daemon=True, name=f"wake-{member}").start()
+    return dirty
+
+
 def main():
     cfg = load_cfg()
     agents = set(cfg["agents"])
@@ -141,87 +223,25 @@ def main():
         state.update(json.loads(STATE_FILE.read_text(encoding="utf-8")))
     state.setdefault("closing_notified", [])
 
-    log(f"门房 v4 上岗，房间动态从 server 拉取，每 {cfg['poll_seconds']}s 巡一次")
+    log(f"门房 v5 上岗（带心跳），房间动态从 server 拉取，每 {cfg['poll_seconds']}s 巡一次")
     while True:
         now = time.time()
-        dirty = False
+        # 心跳是看门人的命：进程活着但循环死了（僵尸）这件事已经发生过。
+        # chatroom-service.ps1 只认这个文件的新鲜度，不认进程存在。
         try:
-            rooms = fetch_rooms(cfg["server"])
+            HB.write_text(str(now), encoding="utf-8")
+        except Exception:
+            pass
+        try:
+            dirty = patrol(cfg, agents, state, now)
         except Exception as e:
-            log(f"拉房间列表失败: {e}")
-            time.sleep(cfg["poll_seconds"])
-            continue
-        for r in rooms:
-            room, members, rstate = r["room"], r["members"], r["state"]
-            if rstate == "closed":
-                continue
-            if rstate == "closing":
-                # 每个房只通知一次；admin 没配无头入口就记账等人来救
-                if room in state["closing_notified"]:
-                    continue
-                admin = r["admin"] or "mingming"
-                spec = cfg["members"].get(admin)
-                if spec and spec.get("cmd"):
-                    state["closing_notified"].append(room)
-                    dirty = True
-                    log(f"「{room}」进入关闭流程，通知管理员 {admin}")
-                    threading.Thread(target=wake, args=(cfg, admin, room),
-                                     kwargs={"closing": True},
-                                     daemon=True, name=f"close-{room}").start()
-                else:
-                    state["closing_notified"].append(room)
-                    dirty = True
-                    log(f"「{room}」进入关闭流程，但管理员 {admin} 没有无头入口，挂了账")
-                continue
-            # open 房：扫新消息
-            if room not in state["cursors"]:
-                d = fetch_messages(cfg["server"], room, 0)
-                state["cursors"][room] = d["cursor"]
-                dirty = True
-                log(f"房间「{room}」游标初始化到 {d['cursor']}（积压 {len(d['messages'])} 条不追）")
-                continue
-            try:
-                d = fetch_messages(cfg["server"], room, state["cursors"][room])
-            except Exception as e:
-                log(f"巡「{room}」失败: {e}")
-                continue
-            msgs = d["messages"]
-            if not msgs:
-                continue
-            state["cursors"][room] = d["cursor"]
-            dirty = True
-            log(f"「{room}」来了 {len(msgs)} 条新消息（{', '.join(m['sender'] for m in msgs)}）")
-            for member, spec in cfg["members"].items():
-                if not spec.get("cmd"):
-                    continue  # 还没配上无头入口的成员
-                mine = [m for m in msgs if m["sender"] != member]
-                if not mine:
-                    continue
-                mentioned = any(f"@{member}" in m["text"] for m in mine)
-                if members and member not in members:
-                    # 限定房：非成员不旁听；被 @ = 邀请，拉进房再叫醒
-                    if not mentioned:
-                        continue
-                    try:
-                        post_json(cfg["server"], "/api/rooms/join", {"room": room, "member": member})
-                        log(f"{member} 被 @ 邀请进「{room}」")
-                    except Exception as e:
-                        log(f"拉 {member} 进「{room}」失败: {e}")
-                human_spoke = any(m["sender"] not in agents for m in mine)
-                if not (human_spoke or mentioned):
-                    continue
-                # 人类发言必须送达；节流只限制 agent 之间的 @ 唤醒。
-                # 同一成员的并发由 wake() 里的锁串行化。
-                if not human_spoke and not due(state, member, cfg, now):
-                    log(f"{member} 该叫但被节流按住（间隔/时额）")
-                    continue
-                state["last_wake"][member] = now
-                state["wake_log"].setdefault(member, []).append(now)
-                # 并行叫醒：一个成员慢（冷启动约 1 分钟）不挡别人的门铃
-                threading.Thread(target=wake, args=(cfg, member, room, mine),
-                                 daemon=True, name=f"wake-{member}").start()
+            log(f"这一轮巡逻整个炸了（已兜住，下轮继续）: {e}")
+            dirty = True  # 至少把 state 落盘窗口保住
         if dirty:
-            STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+            try:
+                STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+            except Exception as e:
+                log(f"state 落盘失败: {e}")
         time.sleep(cfg["poll_seconds"])
 
 
