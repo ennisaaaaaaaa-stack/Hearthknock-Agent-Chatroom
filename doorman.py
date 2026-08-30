@@ -135,8 +135,11 @@ def due(state, member, cfg, now):
     return len(wakes) < cfg["max_wakes_per_hour"]
 
 
-def patrol(cfg, agents, state, now):
-    """巡一轮所有房。返回是否有状态变更。任何单个房间的错都不该炸掉整轮。"""
+def patrol(cfg, agents, state, now, virgin):
+    """巡一轮所有房。返回是否有状态变更。任何单个房间的错都不该炸掉整轮。
+    virgin=True 只在门房平生第一次上岗的那一轮：全量积压不追。
+    之后新发现的房 = 新房开张：积压里若有人类发言，当首批消息投递——
+    否则「建房主的第一句话」永远叫不醒任何人（hui在hearth缺席的根因之一）。"""
     dirty = False
     try:
         rooms = fetch_rooms(cfg["server"])
@@ -167,11 +170,14 @@ def patrol(cfg, agents, state, now):
             continue
         # open 房：扫新消息
         if room not in state["cursors"]:
-            d = fetch_messages(cfg["server"], room, 0)
-            state["cursors"][room] = d["cursor"]
-            dirty = True
-            log(f"房间「{room}」游标初始化到 {d['cursor']}（积压 {len(d['messages'])} 条不追）")
-            continue
+            if virgin:
+                d = fetch_messages(cfg["server"], room, 0)
+                state["cursors"][room] = d["cursor"]
+                dirty = True
+                log(f"房间「{room}」游标初始化到 {d['cursor']}（积压 {len(d['messages'])} 条不追）")
+                continue
+            state["cursors"][room] = 0  # 新房开张：落到正常流程，积压按新消息投递
+            log(f"发现新房间「{room}」，积压按首批消息投递")
         try:
             d = fetch_messages(cfg["server"], room, state["cursors"][room])
         except Exception as e:
@@ -183,6 +189,12 @@ def patrol(cfg, agents, state, now):
         state["cursors"][room] = d["cursor"]
         dirty = True
         log(f"「{room}」来了 {len(msgs)} 条新消息（{', '.join(m['sender'] for m in msgs)}）")
+        # 可观测性：该叫但叫不动的成员，留一行账（hui在hearth缺席就是这条线上的静默）
+        human_any = any(m["sender"] not in agents for m in msgs)
+        missing = [m for m, s in cfg["members"].items()
+                   if not s.get("cmd") and (not members or m in members)]
+        if human_any and missing:
+            log(f"（{room}）{'、'.join(missing)} 没有无头入口，人类发言送不到他们")
         for member, spec in cfg["members"].items():
             if not spec.get("cmd"):
                 continue  # 还没配上无头入口的成员
@@ -223,7 +235,9 @@ def main():
         state.update(json.loads(STATE_FILE.read_text(encoding="utf-8")))
     state.setdefault("closing_notified", [])
 
-    log(f"门房 v5 上岗（带心跳），房间动态从 server 拉取，每 {cfg['poll_seconds']}s 巡一次")
+    log(f"门房 v5.1 上岗（心跳+新房投递），房间动态从 server 拉取，每 {cfg['poll_seconds']}s 巡一次")
+    virgin = not state["cursors"]  # 一个房都不认识 = 平生第一次上岗
+    first = True
     while True:
         now = time.time()
         # 心跳是看门人的命：进程活着但循环死了（僵尸）这件事已经发生过。
@@ -233,10 +247,11 @@ def main():
         except Exception:
             pass
         try:
-            dirty = patrol(cfg, agents, state, now)
+            dirty = patrol(cfg, agents, state, now, virgin and first)
         except Exception as e:
             log(f"这一轮巡逻整个炸了（已兜住，下轮继续）: {e}")
             dirty = True  # 至少把 state 落盘窗口保住
+        first = False
         if dirty:
             try:
                 STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
