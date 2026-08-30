@@ -128,15 +128,34 @@
   .msg.sys { align-self: center; max-width: 90%; }
   .msg.sys .body { border-style: dashed; color: var(--mute); font-size: 13px; }
 
-  footer { display: flex; gap: 10px; padding: 12px 32px 16px; border-top: 1px solid var(--panel-edge); }
+  footer { display: flex; gap: 10px; padding: 12px 32px 16px; border-top: 1px solid var(--panel-edge); align-items: flex-end; }
   footer textarea {
     flex: 1; background: rgba(10,10,12,.5); border: 1px solid var(--panel-edge); color: var(--paper);
     border-radius: 10px; padding: 9px 12px; font: inherit; font-size: 14px; resize: none; height: 46px;
   }
   footer button {
     background: var(--lav); color: var(--ink); border: none; border-radius: 10px;
-    padding: 0 24px; font-family: inherit; font-size: 14px; font-weight: 600; cursor: pointer;
+    padding: 0 24px; height: 46px; font-family: inherit; font-size: 14px; font-weight: 600; cursor: pointer;
   }
+  #attach-btn {
+    background: none; border: 1px solid var(--panel-edge); color: var(--lav-dim);
+    border-radius: 10px; padding: 0 14px; height: 46px; font-size: 17px; cursor: pointer;
+  }
+  #attach-btn:hover { color: var(--lav); border-color: var(--lav); }
+  #pending-file {
+    display: none; align-items: center; gap: 8px; font-size: 12px; color: var(--mute);
+    padding: 4px 32px 0;
+  }
+  #pending-file.show { display: flex; }
+  #pending-file .x { color: var(--warn); cursor: pointer; }
+  .msg .att { margin-top: 6px; }
+  .msg .att img { max-width: 100%; max-height: 320px; border-radius: 8px; display: block; }
+  .msg .att a {
+    color: var(--lav-dim); text-decoration: none; font-size: 13px;
+    border: 1px dashed var(--panel-edge); border-radius: 8px; padding: 4px 10px;
+    display: inline-block;
+  }
+  .msg .att a:hover { color: var(--lav); border-color: var(--lav); }
   footer.disabled { opacity: .45; pointer-events: none; }
 
   @media (max-width: 860px) {
@@ -171,7 +190,10 @@
     <div id="parentline"></div>
   </div>
   <div id="log"></div>
+  <div id="pending-file"><span id="pf-name"></span><span class="x" id="pf-x">✕ 移除</span></div>
   <footer id="foot">
+    <input type="file" id="file-input" style="display:none">
+    <button id="attach-btn" title="发文件/图片">📎</button>
     <textarea id="text" placeholder="说点什么……（Enter 发送，Shift+Enter 换行）"></textarea>
     <button id="send">发送</button>
   </footer>
@@ -180,6 +202,27 @@
 const $ = s => document.querySelector(s);
 let room = localStorage.getItem('cr_room') || '大厅';
 let cursor = 0, roomsData = [], roster = {agents: [], humans: []};
+let pendingFile = null;  // {id, fname, size}
+
+function fmtSize(n) {
+  return n > 1048576 ? (n / 1048576).toFixed(1) + 'MB' : Math.max(1, Math.round(n / 1024)) + 'KB';
+}
+
+$('#attach-btn').onclick = () => $('#file-input').click();
+$('#file-input').onchange = async e => {
+  const f = e.target.files[0];
+  e.target.value = '';
+  if (!f) return;
+  if (f.size > 25 * 1048576) return alert('文件超过 25MB');
+  const r = await fetch('/api/upload?filename=' + encodeURIComponent(f.name), {
+    method: 'POST', headers: {'Content-Type': f.type || 'application/octet-stream'}, body: f});
+  const d = await r.json();
+  if (d.error) return alert(d.error);
+  pendingFile = {id: d.file_id, fname: d.fname, size: f.size};
+  $('#pf-name').textContent = `📎 ${d.fname}（${fmtSize(f.size)}）已就位，随下一条消息发出`;
+  $('#pending-file').classList.add('show');
+};
+$('#pf-x').onclick = () => { pendingFile = null; $('#pending-file').classList.remove('show'); };
 $('#nick').value = localStorage.getItem('cr_nick') || '';
 $('#nick').onchange = () => localStorage.setItem('cr_nick', $('#nick').value.trim());
 
@@ -223,6 +266,23 @@ function addMsg(m) {
   meta.appendChild(b); meta.append(m.ts);
   const body = document.createElement('div');
   body.className = 'body'; body.textContent = m.text;
+  if (m.file) {
+    const att = document.createElement('div');
+    att.className = 'att';
+    if ((m.file.mime || '').startsWith('image/')) {
+      const img = document.createElement('img');
+      img.src = '/api/files/' + m.file.id;
+      img.alt = m.file.fname;
+      att.appendChild(img);
+    } else {
+      const a = document.createElement('a');
+      a.href = '/api/files/' + m.file.id;
+      a.textContent = `📎 ${m.file.fname}（${fmtSize(m.file.size)}）`;
+      a.setAttribute('download', m.file.fname);
+      att.appendChild(a);
+    }
+    body.appendChild(att);
+  }
   div.append(meta, body);
   $('#log').appendChild(div);
   $('#log').scrollTop = $('#log').scrollHeight;
@@ -316,10 +376,13 @@ function switchRoom(n) {
 async function send() {
   const sender = me(), text = $('#text').value.trim();
   if (!sender) return $('#nick').focus();
-  if (!text) return;
+  if (!text && !pendingFile) return;
+  const payload = {room, sender, text: text || `（附件）${pendingFile.fname}`};
+  if (pendingFile) payload.file_id = pendingFile.id;
   $('#text').value = '';
+  pendingFile = null; $('#pending-file').classList.remove('show');
   const d = await api('/api/send', {method: 'POST', headers: {'Content-Type': 'application/json'},
-                                    body: JSON.stringify({room, sender, text})});
+                                    body: JSON.stringify(payload)});
   if (d.error) addMsg({sender: '门房', ts: '', text: '⚠️ ' + d.error});
   poll(); loadRooms();
 }

@@ -1,5 +1,6 @@
 # 数据与运行痕迹
 chat.db
+files/
 *.log
 doorman-state.json
 .doorman-prompt-*.txt

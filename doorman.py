@@ -82,8 +82,14 @@ def build_prompt(cfg, member, room, msgs=None, closing=False):
     server = spec.get("server") or cfg["server"]
     if closing:
         return cfg["summary_template"].format(member=member, room=room, server=server)
-    lines = "\n".join(f"{m['ts']} [{m['sender']}] {m['text']}" for m in msgs)
-    return cfg["prompt_template"].format(member=member, room=room, server=server, messages=lines)
+    lines = []
+    for m in msgs:
+        s = f"{m['ts']} [{m['sender']}] {m['text']}"
+        if m.get("file"):
+            f = m["file"]
+            s += f"\n  （附件: {f['fname']} · {f['mime']} · {f['size']}B → 下载: curl -s -o 文件名 {server}/api/files/{f['id']}）"
+        lines.append(s)
+    return cfg["prompt_template"].format(member=member, room=room, server=server, messages="\n".join(lines))
 
 
 def wake_once(cfg, member, room, msgs=None, closing=False):

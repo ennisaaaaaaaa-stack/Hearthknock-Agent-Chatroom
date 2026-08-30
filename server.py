@@ -24,6 +24,7 @@ API:
 """
 
 import json, sqlite3, sys, threading
+import urllib.parse
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -31,8 +32,10 @@ from urllib.parse import urlparse, parse_qs
 
 BASE = Path(__file__).parent
 DB = BASE / "chat.db"
+FILES = BASE / "files"
 ROSTER = BASE / "roster.json"
 _lock = threading.Lock()
+MAX_UPLOAD = 25 * 1024 * 1024  # 25MB
 
 # 粗估：中英混合聊天约 0.7 token/字符（CJK 偏高英文偏低，取保守值）。
 # 「不写死」= 阈值是软的，且存储本来就是整条消息，不会截断在半个回合里。
@@ -45,6 +48,14 @@ def db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         room TEXT NOT NULL, sender TEXT NOT NULL,
         text TEXT NOT NULL, ts TEXT NOT NULL)""")
+    # v3 迁移：消息可以带一个附件
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()]
+    if "file_id" not in cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN file_id INTEGER")
+    conn.execute("""CREATE TABLE IF NOT EXISTS files(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        fname TEXT NOT NULL, mime TEXT NOT NULL,
+        size INTEGER NOT NULL, ts TEXT NOT NULL)""")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_msg_room ON messages(room, id)")
     conn.execute("""CREATE TABLE IF NOT EXISTS rooms(
         room TEXT PRIMARY KEY,
@@ -111,10 +122,32 @@ class H(BaseHTTPRequestHandler):
             since = int(q.get("since", ["0"])[0])
             with _lock, db() as c:
                 rows = c.execute(
-                    "SELECT id,room,sender,text,ts FROM messages WHERE room=? AND id>? ORDER BY id LIMIT 500",
+                    """SELECT m.id,m.room,m.sender,m.text,m.ts,m.file_id,f.fname,f.mime,f.size
+                       FROM messages m LEFT JOIN files f ON f.id=m.file_id
+                       WHERE m.room=? AND m.id>? ORDER BY m.id LIMIT 500""",
                     (room, since)).fetchall()
-            msgs = [{"id": r[0], "room": r[1], "sender": r[2], "text": r[3], "ts": r[4]} for r in rows]
+            msgs = [{"id": r[0], "room": r[1], "sender": r[2], "text": r[3], "ts": r[4],
+                     "file": {"id": r[5], "fname": r[6], "mime": r[7], "size": r[8]} if r[5] else None}
+                    for r in rows]
             self._json({"messages": msgs, "cursor": msgs[-1]["id"] if msgs else since})
+        elif u.path.startswith("/api/files/"):
+            fid = u.path.rsplit("/", 1)[1]
+            if not fid.isdigit():
+                return self._json({"error": "not found"}, 404)
+            with _lock, db() as c:
+                r = c.execute("SELECT fname,mime,size FROM files WHERE id=?", (fid,)).fetchone()
+            fp = FILES / fid
+            if not r or not fp.exists():
+                return self._json({"error": "not found"}, 404)
+            body = fp.read_bytes()
+            disp = "inline" if r[1].startswith("image/") else "attachment"
+            self.send_response(200)
+            self.send_header("Content-Type", r[1])
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Disposition",
+                             f"{disp}; filename*=UTF-8''{urllib.parse.quote(r[0])}")
+            self.end_headers()
+            self.wfile.write(body)
         elif u.path == "/api/rooms":
             with _lock, db() as c:
                 rows = c.execute(
@@ -140,6 +173,8 @@ class H(BaseHTTPRequestHandler):
         try:
             if path == "/api/send":
                 return self._send()
+            elif path == "/api/upload":
+                return self._upload()
             elif path == "/api/rooms":
                 return self._create_room()
             elif path == "/api/rooms/join":
@@ -150,6 +185,26 @@ class H(BaseHTTPRequestHandler):
         except Exception as e:
             self._json({"error": str(e)}, 400)
 
+    def _upload(self):
+        # 原始字节流上传：curl -X POST --data-binary @file \
+        #   "…/api/upload?filename=<url编码>" -H "Content-Type: <mime>"
+        q = parse_qs(urlparse(self.path).query)
+        fname = (q.get("filename", ["file"])[0]).strip().replace("/", "_").replace("\\", "_")[:100] or "file"
+        n = int(self.headers.get("Content-Length", 0))
+        if n <= 0:
+            return self._json({"error": "empty body"}, 400)
+        if n > MAX_UPLOAD:
+            return self._json({"error": "too large (>25MB)"}, 400)
+        data = self.rfile.read(n)
+        mime = self.headers.get("Content-Type", "application/octet-stream").split(";")[0].strip()
+        with _lock, db() as c:
+            cur = c.execute("INSERT INTO files(fname,mime,size,ts) VALUES(?,?,?,?)",
+                            (fname, mime, n, now()))
+            fid = cur.lastrowid
+        FILES.mkdir(exist_ok=True)
+        (FILES / str(fid)).write_bytes(data)
+        self._json({"ok": True, "file_id": fid, "fname": fname})
+
     def _send(self):
         data = self._body()
         room = (data.get("room") or "大厅").strip()[:50]
@@ -159,15 +214,21 @@ class H(BaseHTTPRequestHandler):
             return self._json({"error": "empty text"}, 400)
         if len(text) > 8000:
             return self._json({"error": "too long"}, 400)
+        file_id = data.get("file_id")
         with _lock, db() as c:
+            if file_id is not None:
+                f = c.execute("SELECT id FROM files WHERE id=?", (file_id,)).fetchone()
+                if not f:
+                    return self._json({"error": "no such file"}, 404)
+                file_id = f[0]
             r = get_room(c, room)
             if r and r["state"] != "open":
                 return self._json({"error": f"房间「{room}」已{r['state'] == 'closing' and '进入关闭流程（等摘要）' or '关闭'}，请去续房"},
                                   409)
             if not r:  # 老习惯：发到不存在的房 = 开一个开放房
                 c.execute("INSERT INTO rooms(room, created_ts) VALUES(?,?)", (room, now()))
-            cur = c.execute("INSERT INTO messages(room,sender,text,ts) VALUES(?,?,?,?)",
-                            (room, sender, text, now()))
+            cur = c.execute("INSERT INTO messages(room,sender,text,ts,file_id) VALUES(?,?,?,?,?)",
+                            (room, sender, text, now(), file_id))
             mid = cur.lastrowid
             closed = False
             if est_tokens(c, room) >= CLOSE_THRESHOLD_TOKENS:
