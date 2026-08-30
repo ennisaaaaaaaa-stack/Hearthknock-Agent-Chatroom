@@ -15,6 +15,7 @@ msg.json
 wake-zhaozhao.sh
 
 # 家人投递到客厅目录的工作文档不是项目代码，默认不入库
-AI*.md
+/*.md
+!/README.md
 *.docx
 doorman.heartbeat
