@@ -7,11 +7,17 @@ BASE="http://100.116.162.114:7788"
 DIR="$HOME/chatroom"
 mkdir -p "$DIR" && cd "$DIR"
 
-echo ">> 从客厅拉门房 v5.1 和配置模板"
+echo ">> 从客厅拉门房 v5.1"
 curl -sf -o doorman.py "$BASE/api/files/5"
-curl -sf -o doorman.json "$BASE/api/files/6"
 
-python3 - <<'PYEOF'
+# 配置是每台机器自己填的，重跑不能覆盖（两头撞车教训 2026-08-30）：
+# 已存在则备份后跳过，不存在才拉模板并改写
+if [ -f doorman.json ]; then
+  cp doorman.json "doorman.json.bak.$(date +%Y%m%d-%H%M%S)"
+  echo ">> doorman.json 已存在，备份后跳过（配置以现有为准）"
+else
+  curl -sf -o doorman.json "$BASE/api/files/6"
+  python3 - <<'PYEOF'
 import json
 cfg = json.load(open("doorman.json", encoding="utf-8"))
 cfg["server"] = "http://100.116.162.114:7788"
@@ -21,6 +27,7 @@ cfg["members"] = {"hui": {"cmd": None, "timeout_sec": 900,
 json.dump(cfg, open("doorman.json", "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 print(">> doorman.json 已指向客厅；members 只留hui，cmd 待填")
 PYEOF
+fi
 
 echo ">> 写 systemd 单元"
 sudo tee /etc/systemd/system/hearthknock-doorman.service > /dev/null <<UNIT
