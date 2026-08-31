@@ -39,7 +39,8 @@ SENDER = "仵作"
 STALE_MIN = 10       # wire 沉默多久算断气
 FRESH_HOURS = 24     # 只报多久以内的新尸
 TAIL_BYTES = 65536   # 从 wire 尾部读这么多找最后一条 loop 事件
-HEAD_BYTES = 65536   # 从 wire 头部读这么多找第一条 user 消息（判断差事来源）
+HEAD_BYTES = 262144  # 从 wire 头部读这么多找门房叫醒包——系统提示和工具清单很大，
+                     # 实测叫醒标记出现在 ~70KB 处，64KB 的窗口会恰好差一步
 
 # v2 接力：死在门房差事上的尸体，直接把讣告喂给一个新 session 接手。
 KIMI = Path.home() / ".kimi-code" / "bin" / "kimi.exe"
@@ -167,9 +168,18 @@ def wire_head(wire: Path) -> str:
         return ""
 
 
-def spawn_relay(sid: str, wire: Path, cwd: str, died_at: str, tool: str, args: str) -> bool:
+def origin_room(head: str):
+    """从门房叫醒包里剖出出事房间：「[客厅·门房叫醒] 房间「X」有新消息」。"""
+    import re
+    m = re.search(r"门房叫醒\]\s*房间「(.+?)」", head)
+    return m.group(1) if m else None
+
+
+def spawn_relay(sid: str, wire: Path, cwd: str, died_at: str, tool: str, args: str,
+                oroom: str = None) -> bool:
     """把讣告喂给一个新 session 接手。detach 出去就不管——它若也死了，
     仵作下轮会按「只报丧不接力」收它（RELAY_MARK 防循环）。"""
+    backroom = oroom or "大厅"
     prompt = (
         f"{RELAY_MARK} 一个被门房叫醒的 session 暴毙了，你是来接棒的。\n"
         f"- 死者: {sid}（断气于 {died_at}，死时在做 {tool} — {args or '无参数摘要'}）\n"
@@ -178,10 +188,10 @@ def spawn_relay(sid: str, wire: Path, cwd: str, died_at: str, tool: str, args: s
         f"按顺序做：\n"
         f"1. 读 wire 尾部几千字，判断它做到哪、有没有没收尾的活。\n"
         f"2. 活没干完就接着干完；已经干完了就只确认。\n"
-        f"3. 收尾后到客厅「大厅」发一帖说明结论：curl -s -X POST {SERVER}/api/send "
+        f"3. 收尾后回出事房间「{backroom}」发一帖说明结论：curl -s -X POST {SERVER}/api/send "
         f"-H \"Content-Type: application/json\" --data @临时文件 "
-        f"（JSON: {{\"room\":\"大厅\",\"sender\":\"mingming\",\"text\":\"[接力] ……结论……\"}}；"
-        f"中文先写 UTF-8 临时文件再 --data @文件，防 GBK 乱码）。\n"
+        f"（JSON: {{\"room\":\"{backroom}\",\"sender\":\"mingming\",\"text\":\"[接力] ……结论……\"}}；"
+        f"中文先写 UTF-8 临时文件再 --data @文件，防 GBK 乱码；房若已关就发大厅）。\n"
         f"4. 别动死者的 session 目录和仵作的台账。像在家里说话一样，别长篇大论。"
     )
     try:
@@ -199,17 +209,23 @@ def spawn_relay(sid: str, wire: Path, cwd: str, died_at: str, tool: str, args: s
         return False
 
 
-def post_report(text: str) -> bool:
-    try:
-        body = json.dumps({"room": ROOM, "sender": SENDER, "text": text},
-                          ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(f"{SERVER}/api/send", data=body,
-                                     headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return r.status == 200
-    except Exception as e:
-        log(f"报丧帖投递失败: {e}")
-        return False
+def post_report(text: str, room: str = ROOM) -> bool:
+    """报丧帖投递：默认抬进出事房间；房关了/不存在/失败就抬回大厅。"""
+    for target in (room, ROOM) if room != ROOM else (ROOM,):
+        try:
+            body = json.dumps({"room": target, "sender": SENDER, "text": text},
+                              ensure_ascii=False).encode("utf-8")
+            req = urllib.request.Request(f"{SERVER}/api/send", data=body,
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                ok = r.status == 200 and not json.loads(r.read().decode("utf-8")).get("error")
+            if ok:
+                if target != room:
+                    log(f"出事房「{room}」投不进，讣告抬回了大厅")
+                return True
+        except Exception as e:
+            log(f"报丧帖投递「{target}」失败: {e}")
+    return False
 
 
 def main(dry_run: bool) -> None:
@@ -220,9 +236,16 @@ def main(dry_run: bool) -> None:
         return
     for sid, wire, cwd, died_at, tool, args in corpses:
         short = sid.replace("session_", "")[:8]
+        head = wire_head(wire)
+        oroom = origin_room(head)  # 死在哪个房间的差事，讣告就抬进哪个房间
         text = (
             f"[仵作·报丧] 发现一具 session 尸体 @mingming\n"
             f"- session: {short}…\n"
+            f"- 出事房间: 「{oroom}」\n" if oroom else
+            f"[仵作·报丧] 发现一具 session 尸体 @mingming\n"
+            f"- session: {short}…\n"
+        )
+        text += (
             f"- 工作目录: {cwd or '（读不到）'}\n"
             f"- 断气时间: {died_at}（wire 最后落笔，沉默已超 {STALE_MIN} 分钟）\n"
             f"- 死时在做: {tool} — {args or '（无参数摘要）'}\n"
@@ -230,25 +253,23 @@ def main(dry_run: bool) -> None:
             f"台账里没有它的讣告（非正常死亡），活可能没收尾。想接力：读 wire 尾巴判断做到哪。"
         )
         if dry_run:
-            head = wire_head(wire)
             relayable = DOORMAN_MARK in head and RELAY_MARK not in head
-            log(f"[dry-run] 发现尸体 {short}（{died_at}，死在 {tool}，"
+            log(f"[dry-run] 发现尸体 {short}（{died_at}，死在 {tool}，房「{oroom}」，"
                 f"{'可接力' if relayable else '只报丧'}）——未投递")
             print(text)
             print("---")
             continue
-        if post_report(text):
+        if post_report(text, room=oroom or ROOM):
             # v2：死在门房差事上的尸体，讣告直接喂给新 session 接力；
             # 接力 session 自己若死了（RELAY_MARK）只报丧——防丧葬流水线
-            head = wire_head(wire)
             relayed = False
             if DOORMAN_MARK in head and RELAY_MARK not in head:
-                relayed = spawn_relay(sid, wire, cwd, died_at, tool, args)
+                relayed = spawn_relay(sid, wire, cwd, died_at, tool, args, oroom)
             append_ledger({"type": "corpse_reported", "session_id": sid,
                            "ts": datetime.now().isoformat(timespec="seconds"),
                            "wire": str(wire), "died_at": died_at, "died_doing": tool,
-                           "relayed": relayed})
-            log(f"报丧已投递：{short}（{died_at}，死在 {tool}{'，已接力' if relayed else ''}）")
+                           "room": oroom, "relayed": relayed})
+            log(f"报丧已投递「{oroom or ROOM}」：{short}（{died_at}，死在 {tool}{'，已接力' if relayed else ''}）")
         else:
             log(f"报丧投递失败，下轮重试：{short}")
 
