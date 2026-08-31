@@ -74,9 +74,11 @@ def main():
 
     conn = sqlite3.connect(DB)
     conn.executescript(SCHEMA)
-    if conn.execute("SELECT COUNT(*) FROM cursors").fetchone()[0]:
+    # 「已迁过」的事实源是 meta.migration_ready 标记，不是 cursors 表空不空——
+    # v7 server 上岗后新建房/新成员 join 会生出合法的 birth 行，表非空≠已迁过
+    if conn.execute("SELECT value FROM meta WHERE key='migration_ready'").fetchone():
         conn.close()
-        fail("cursors 表非空——已迁过或 v7 已上岗，拒绝重复迁移（会把新台账覆盖回旧值）")
+        fail("已迁过（meta.migration_ready 已落账）——拒绝重复迁移（会把新台账覆盖回旧值）")
 
     rooms = {r[0]: {"members": json.loads(r[1]), "state": r[2]}
              for r in conn.execute("SELECT room,members,state FROM rooms").fetchall()}
@@ -98,8 +100,13 @@ def main():
                          "——会跳过或重放真实消息，不猜，停机")
                 targets = rooms[room]["members"] or roster  # 限定房=房内成员，开放房=花名册全员
                 for m in targets:
-                    conn.execute("""INSERT INTO cursors(room,member,cursor,start_cursor,updated_ts)
-                                    VALUES(?,?,?,?,?)""", (room, m, cur, cur, now))
+                    try:
+                        conn.execute("""INSERT INTO cursors(room,member,cursor,start_cursor,updated_ts)
+                                        VALUES(?,?,?,?,?)""", (room, m, cur, cur, now))
+                    except sqlite3.IntegrityError:
+                        # 该行已在（v7 上岗后出生的 birth 行）：旧值不能盖新行，不猜，停机
+                        fail(f"「{room}/{m}」已有 cursor 行（v7 上岗后出生的新行）"
+                             "——旧游标不能覆盖它，停机人工对账")
                 conn.execute("""INSERT INTO cursor_events(room,member,kind,reason,actor,ts)
                                 VALUES(?,?,?,?,?,?)""",
                              (room, "*", "migrate",

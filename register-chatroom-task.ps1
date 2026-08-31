@@ -4,10 +4,14 @@
 # Run once as the user (no admin needed). KEEP THIS FILE PURE ASCII.
 
 $ps = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+$wscript = "C:\Windows\System32\wscript.exe"
+$vbs = "C:\Users\<winuser>\Documents\kimi\workspace\tideline-memory\kimi-code\run-hidden.vbs"
 $launcher = "C:\Users\<winuser>\Documents\kimi\workspace\chatroom\chatroom-service.ps1"
 
-$action = New-ScheduledTaskAction -Execute $ps `
-    -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$launcher`""
+# Route through wscript + run-hidden.vbs: launching powershell.exe directly from
+# an interactive-task action flashes a console window every 5 minutes.
+$action = New-ScheduledTaskAction -Execute $wscript `
+    -Argument "`"$vbs`" `"$ps`" -NoProfile -ExecutionPolicy Bypass -File `"$launcher`""
 
 $t1 = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $t2 = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) `

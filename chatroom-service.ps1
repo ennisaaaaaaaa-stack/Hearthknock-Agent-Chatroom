@@ -47,10 +47,30 @@ if ($proc.Count -gt 0 -and (Test-Path $hb)) {
 if ($alive) {
     Log "doorman alive (heartbeat fresh), skip"
 } else {
-    if ($proc.Count -gt 0) {
-        $proc | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-        Log "doorman zombie killed (heartbeat stale or missing)"
+    # v7.2 P0 migration gate: never start the doorman while the server reports
+    # migration_ready=false or cursor coverage gaps. A doorman started during the
+    # cutover window would write state/heartbeat and could erase the very cursors
+    # migrate_cursors_v7.py still needs to migrate. Same gate as doorman.py itself.
+    $gateOk = $false
+    try {
+        $st = Invoke-RestMethod -Uri "http://localhost:7788/api/cursors/status" -TimeoutSec 5
+        $gateOk = [bool]$st.ready
+    } catch { $gateOk = $false }
+    if (-not $gateOk) {
+        Log "migration gate NOT passed (status unreachable or ready=false) - doorman NOT started; run migrate_cursors_v7.py first"
+    } else {
+        if ($proc.Count -gt 0) {
+            $proc | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+            Log "doorman zombie killed (heartbeat stale or missing)"
+        }
+        Start-Process -FilePath $pyw -ArgumentList "doorman.py" -WorkingDirectory $root -WindowStyle Hidden
+        Log "doorman.py started"
     }
-    Start-Process -FilePath $pyw -ArgumentList "doorman.py" -WorkingDirectory $root -WindowStyle Hidden
-    Log "doorman.py started"
 }
+
+# --- corpse-watch.py: session coroner ---
+# Finds violently-killed kimi-code sessions (no obituary + wire ends mid-turn +
+# wire silent) and posts one death notice per corpse to the chatroom. Idempotent:
+# reported session ids are recorded in ~/.kimi-code/tideline-state/session-ledger.jsonl.
+Start-Process -FilePath $pyw -ArgumentList "corpse-watch.py" -WorkingDirectory $root -WindowStyle Hidden
+Log "corpse-watch dispatched"
