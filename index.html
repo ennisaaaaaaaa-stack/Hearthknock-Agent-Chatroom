@@ -224,6 +224,10 @@
 const $ = s => document.querySelector(s);
 let room = localStorage.getItem('cr_room') || '大厅';
 let cursor = 0, roomsData = [], roster = {agents: [], humans: []};
+// 系统位：门房（值班通知）和仵作（报丧）的发言渲染成系统消息，
+// 也不出现在建房/拉人的成员候选里——它们是设施，不是住户
+const SYS_SENDERS = ['门房', '仵作'];
+const isSysSender = n => SYS_SENDERS.includes(n);
 let pendingFile = null;  // {id, fname, size}
 
 function fmtSize(n) {
@@ -258,7 +262,7 @@ $('#new-btn').onclick = () => {
   if (!m.classList.contains('show')) return;
   const picks = $('#member-picks');
   picks.innerHTML = '';
-  [...roster.humans, ...roster.agents].filter(n => n !== '门房').forEach(n => {
+  [...roster.humans, ...roster.agents].filter(n => !isSysSender(n)).forEach(n => {
     const l = document.createElement('label');
     const c = document.createElement('input');
     c.type = 'checkbox'; c.value = n;
@@ -279,7 +283,7 @@ $('#create-room').onclick = async () => {
 };
 
 function addMsg(m) {
-  const isSys = m.sender === '门房';
+  const isSys = isSysSender(m.sender);
   const div = document.createElement('div');
   div.className = 'msg' + (isSys ? ' sys' : (m.sender === me() ? ' me' : ''));
   const meta = document.createElement('div');
@@ -439,7 +443,7 @@ function renderSettings() {
   // 管理员
   s.append('管理员：');
   const sel = document.createElement('select');
-  [...roster.humans, ...roster.agents].filter(n => n !== '门房').forEach(n => {
+  [...roster.humans, ...roster.agents].filter(n => !isSysSender(n)).forEach(n => {
     const o = document.createElement('option');
     o.value = n; o.textContent = n;
     if (n === (r.admin || roster.default_admin)) o.selected = true;
@@ -469,7 +473,7 @@ function renderSettings() {
   d0.value = ''; d0.textContent = '＋拉人进房';
   addSel.appendChild(d0);
   [...roster.humans, ...roster.agents]
-    .filter(n => n !== '门房' && !(r.members || []).includes(n))
+    .filter(n => !isSysSender(n) && !(r.members || []).includes(n))
     .forEach(n => {
       const o = document.createElement('option');
       o.value = n; o.textContent = n;
