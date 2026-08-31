@@ -191,6 +191,7 @@
   <div id="brand"><h1>客厅</h1><div class="sub">family chatroom · 谁在都能说话</div></div>
   <div class="nav-title">房间</div>
   <div id="room-list"></div>
+  <details class="closed-rooms" id="agent-rooms"><summary>agent 们的房</summary><div id="agent-list"></div></details>
   <div class="nav-title">归档</div>
   <details class="closed-rooms"><summary>已关闭的房</summary><div id="closed-list"></div></details>
   <div id="side-foot">
@@ -342,8 +343,17 @@ async function loadRooms() {
     roomsData.push({room, members: [], state: 'open', count: 0, est_tokens: 0});
   const open = roomsData.filter(r => r.state !== 'closed');
   const closed = roomsData.filter(r => r.state === 'closed');
+  // 不含人类的限定房 = agent 们自己的房：显示但不打扰——默认折叠，
+  // tiexin随时能展开看（完全水聊房 2026-08-30 共识：别搞成地下董事会）。
+  // 开放房（members 为空 = 全员入铃）天然含人类，不算。
+  const agentOnly = r => r.members && r.members.length > 0 &&
+    !r.members.some(m => roster.humans.includes(m));
   const list = $('#room-list'); list.innerHTML = '';
-  open.forEach(r => list.appendChild(roomItem(r)));
+  open.filter(r => !agentOnly(r)).forEach(r => list.appendChild(roomItem(r)));
+  const al = $('#agent-list'); al.innerHTML = '';
+  open.filter(agentOnly).forEach(r => al.appendChild(roomItem(r)));
+  // 正坐在 agent 房里时把它所在的折叠组撑开，别让人觉得房丢了
+  $('#agent-rooms').open = !!(cur() && agentOnly(cur()) && cur().state !== 'closed');
   const cl = $('#closed-list'); cl.innerHTML = '';
   closed.forEach(r => cl.appendChild(roomItem(r)));
   renderRoomState();
