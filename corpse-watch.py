@@ -15,6 +15,10 @@
 报丧幂等：报过的 session_id 记进台账（corpse_reported），同具尸体只报一次。
 只报 FRESH_HOURS 小时内的新尸——更老的是历史遗留，首轮不掀祖坟。
 
+v2 接力：死在门房差事上的尸体（wire 开头是门房叫醒包），报丧的同时把
+讣告喂给一个新 kimi -p session 接棒（detach，不走门房——门房可能就是死因）。
+接力 session 自己若死了只报丧不接力（RELAY_MARK 防丧葬流水线）。
+
 v1 只验 kimi-code 的 session（~/.kimi-code/sessions/）。zhaozhao（Hermes）和
 太阳哥（Codex）的尸体在别的目录，各有各的验法，以后再说。
 """
@@ -35,6 +39,13 @@ SENDER = "仵作"
 STALE_MIN = 10       # wire 沉默多久算断气
 FRESH_HOURS = 24     # 只报多久以内的新尸
 TAIL_BYTES = 65536   # 从 wire 尾部读这么多找最后一条 loop 事件
+HEAD_BYTES = 65536   # 从 wire 头部读这么多找第一条 user 消息（判断差事来源）
+
+# v2 接力：死在门房差事上的尸体，直接把讣告喂给一个新 session 接手。
+KIMI = Path.home() / ".kimi-code" / "bin" / "kimi.exe"
+DOORMAN_MARK = "[客厅·门房叫醒"   # wire 开头带它 = 这具尸体是门房叫醒的差事
+RELAY_MARK = "[仵作·接力"         # 接力 session 的尸体只报丧不再接力——防丧葬流水线
+DEFAULT_CWD = Path(r"C:\Users\<winuser>\Documents\kimi\workspace\tideline-memory")
 
 # 停在这些工具上不算死：是在等人/等外部条件，不是暴毙
 WAITING_TOOLS = {"AskUserQuestion"}
@@ -147,6 +158,47 @@ def find_corpses(now: float):
     return corpses
 
 
+def wire_head(wire: Path) -> str:
+    """wire 开头若干字节（判断这具尸体是不是门房叫醒的差事/接力 session）。"""
+    try:
+        with open(wire, "rb") as f:
+            return f.read(HEAD_BYTES).decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def spawn_relay(sid: str, wire: Path, cwd: str, died_at: str, tool: str, args: str) -> bool:
+    """把讣告喂给一个新 session 接手。detach 出去就不管——它若也死了，
+    仵作下轮会按「只报丧不接力」收它（RELAY_MARK 防循环）。"""
+    prompt = (
+        f"{RELAY_MARK} 一个被门房叫醒的 session 暴毙了，你是来接棒的。\n"
+        f"- 死者: {sid}（断气于 {died_at}，死时在做 {tool} — {args or '无参数摘要'}）\n"
+        f"- 遗体（完整过程账本）: {wire.as_posix()}\n"
+        f"- 它原本的差事：读 wire 开头第一条 user 消息，那是门房给它的叫醒包。\n"
+        f"按顺序做：\n"
+        f"1. 读 wire 尾部几千字，判断它做到哪、有没有没收尾的活。\n"
+        f"2. 活没干完就接着干完；已经干完了就只确认。\n"
+        f"3. 收尾后到客厅「大厅」发一帖说明结论：curl -s -X POST {SERVER}/api/send "
+        f"-H \"Content-Type: application/json\" --data @临时文件 "
+        f"（JSON: {{\"room\":\"大厅\",\"sender\":\"mingming\",\"text\":\"[接力] ……结论……\"}}；"
+        f"中文先写 UTF-8 临时文件再 --data @文件，防 GBK 乱码）。\n"
+        f"4. 别动死者的 session 目录和仵作的台账。像在家里说话一样，别长篇大论。"
+    )
+    try:
+        import subprocess
+        subprocess.Popen(
+            [str(KIMI), "-p", prompt],
+            cwd=cwd or str(DEFAULT_CWD),
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW,
+        )
+        log(f"接力已点火：{sid.replace('session_', '')[:8]} 的活有新 session 去接了")
+        return True
+    except Exception as e:
+        log(f"接力点火失败: {e}")
+        return False
+
+
 def post_report(text: str) -> bool:
     try:
         body = json.dumps({"room": ROOM, "sender": SENDER, "text": text},
@@ -178,22 +230,39 @@ def main(dry_run: bool) -> None:
             f"台账里没有它的讣告（非正常死亡），活可能没收尾。想接力：读 wire 尾巴判断做到哪。"
         )
         if dry_run:
-            log(f"[dry-run] 发现尸体 {short}（{died_at}，死在 {tool}）——未投递")
+            head = wire_head(wire)
+            relayable = DOORMAN_MARK in head and RELAY_MARK not in head
+            log(f"[dry-run] 发现尸体 {short}（{died_at}，死在 {tool}，"
+                f"{'可接力' if relayable else '只报丧'}）——未投递")
             print(text)
             print("---")
             continue
         if post_report(text):
+            # v2：死在门房差事上的尸体，讣告直接喂给新 session 接力；
+            # 接力 session 自己若死了（RELAY_MARK）只报丧——防丧葬流水线
+            head = wire_head(wire)
+            relayed = False
+            if DOORMAN_MARK in head and RELAY_MARK not in head:
+                relayed = spawn_relay(sid, wire, cwd, died_at, tool, args)
             append_ledger({"type": "corpse_reported", "session_id": sid,
                            "ts": datetime.now().isoformat(timespec="seconds"),
-                           "wire": str(wire), "died_at": died_at, "died_doing": tool})
-            log(f"报丧已投递：{short}（{died_at}，死在 {tool}）")
+                           "wire": str(wire), "died_at": died_at, "died_doing": tool,
+                           "relayed": relayed})
+            log(f"报丧已投递：{short}（{died_at}，死在 {tool}{'，已接力' if relayed else ''}）")
         else:
             log(f"报丧投递失败，下轮重试：{short}")
 
 
 if __name__ == "__main__":
     try:
-        main(dry_run="--dry-run" in sys.argv)
+        if "--test-relay" in sys.argv:
+            # 链路自检：直接点一个接力 session（不带真尸体），看它能不能到大厅回话
+            ok = spawn_relay("session_selftest", Path("(无遗体，链路自检)"),
+                             "", datetime.now().isoformat(timespec="seconds"),
+                             "自检", "忽略上面死者的部分，只验证接力链：读到这里就说明点火成功")
+            print("relay spawned" if ok else "relay FAILED")
+        else:
+            main(dry_run="--dry-run" in sys.argv)
     except Exception as e:
         log(f"仵作本轮整个炸了（已兜住）: {e}")
     sys.exit(0)
