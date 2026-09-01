@@ -15,9 +15,17 @@
 - fail-closed：见到 --prompt-file 就必须读成功，文件缺失/读失败 exit=2 且
   绝不启动 codex——路径字符串当 prompt 发出去、exit=0 误 ack 真消息的
   fail-open 洞（太阳哥 2026-09-01 #227 最终 blocker）。没有 flag 才原样透传
+- 不信 exit code（太阳哥 2026-09-02 #247，实测坐实）：codex 有 hermes 同款
+  exit 0 假成功洞——ghost session resume exit=0 且一个事件都没有；坏模型
+  exit=0 且事件流里是 turn.failed。exec 模式强制 --json，成功必须同时满足
+  exit=0 且本轮出现终态 turn.completed；turn.failed 或无 completed 一律
+  exit=3（门房不 ack，下轮巡逻重投，at-least-once 不变）。
+  注意 turn 里的 item.completed type=error（WebSocket  fallback 噪音）不算失败，
+  判据只认 turn.completed / turn.failed 两个终态事件。
 用法: python wake-taiyang.py exec resume --skip-git-repo-check <session-id> --prompt-file <prompt-file>
 """
 
+import json
 import subprocess
 import sys
 import tomllib
@@ -89,15 +97,56 @@ def split_prompt_file(args):
     return args[:i] + ["-"] + args[i + 2:], text
 
 
+def parse_turn_events(raw):
+    """从 codex --json 的 stdout（JSONL bytes）里收事件 type。
+    非 JSON 行（警告等）跳过。返回 (types set, thread_id or None)。"""
+    types = set()
+    thread_id = None
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        t = ev.get("type")
+        if t:
+            types.add(t)
+        if t == "thread.started" and ev.get("thread_id"):
+            thread_id = ev["thread_id"]
+    return types, thread_id
+
+
 def main():
     args, prompt = split_prompt_file(sys.argv[1:])
     codex = resolve_codex()
     if not codex:
         print("[wake-taiyang] 找不到任何 codex.exe", file=sys.stderr)
         return 127
+    # exec 才有一轮 turn 可验；--version 等别的用法原样透传
+    if "exec" not in args:
+        p = subprocess.run([str(codex)] + args,
+                           input=prompt.encode("utf-8") if prompt is not None else None)
+        return p.returncode
+    if "--json" not in args:
+        args = args + ["--json"]
+    # stdout 抓来判 turn 终态，判完原样吐回（门房日志链路不变）；stderr 让 child 直接继承
     p = subprocess.run([str(codex)] + args,
-                       input=prompt.encode("utf-8") if prompt is not None else None)
-    return p.returncode
+                       input=prompt.encode("utf-8") if prompt is not None else None,
+                       stdout=subprocess.PIPE)
+    sys.stdout.buffer.write(p.stdout)
+    sys.stdout.buffer.flush()
+    types, thread_id = parse_turn_events(p.stdout)
+    if thread_id:
+        print(f"[wake-taiyang] thread_id={thread_id}", file=sys.stderr)
+    if p.returncode == 0 and "turn.completed" in types and "turn.failed" not in types:
+        return 0
+    # 不信 exit code：turn.failed 或无 completed 一律 exit=3（不 ack，等重投）。
+    # 原始非零 rc 记进 stderr 留账，对外只认 3——门房侧「非零即失败」语义不变
+    print(f"[wake-taiyang] 本轮没有 turn.completed（rc={p.returncode}, "
+          f"events={sorted(types) or '无'}），按失败 exit=3", file=sys.stderr)
+    return 3
 
 
 if __name__ == "__main__":
