@@ -511,7 +511,7 @@ def main():
         state.setdefault(k, {} if k in ("last_wake", "wake_log") else [])
     state.pop("cursors", None)  # v6 遗存：游标已由 migrate_cursors_v7.py 迁进hearth台账，本地这份从此作废
 
-    log(f"门房 v7.3 上岗（游标台账在hearth，写游标 = prepare 签发投递单 + ack 确认单），房间动态从 server 拉取，每 {cfg['poll_seconds']}s 巡一次")
+    log(f"门房 v7.4 上岗（游标台账在hearth，写游标 = prepare 签发投递单 + ack 确认单），房间动态从 server 拉取，每 {cfg['poll_seconds']}s 巡一次")
     while True:
         now = time.time()
         # 心跳是看门人的命：进程活着但循环死了（僵尸）这件事已经发生过。
