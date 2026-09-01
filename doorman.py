@@ -278,9 +278,12 @@ def wake_once(cfg, member, room, msgs=None, closing=False, overflow=0):
     what = "关房摘要" if closing else f"{len(msgs)} 条"
     log(f"叫醒 {member}（房间「{room}」，{what}）")
     try:
+        # 被叫醒的是控制台程序（kimi.exe / wsl.exe），不加 CREATE_NO_WINDOW
+        # 每次叫醒都会给tiexin弹一个黑窗——门房自己住后台，叫醒也不能扰民
         p = subprocess.run(cmd, cwd=spec.get("cwd") or str(BASE),
                            timeout=spec.get("timeout_sec", 900),
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
         log(f"{member} 归位，exit={p.returncode}")
         if p.stdout and p.stdout.strip():
             log(f"{member} 说: {p.stdout.strip()[:200]}")
