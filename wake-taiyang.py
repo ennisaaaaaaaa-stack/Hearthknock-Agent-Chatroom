@@ -9,11 +9,13 @@
 
 - 配置路径失效时兜底：扫 bin/*/codex.exe 取最新（mtime），并在 stderr 留账
 - 退出码原样透传——门房的 at-least-once ack 只看 exit=0，链条不变
-- prompt 走 stdin：门房把 {prompt_file} 作为最后一个参数传进来（.txt），
-  wrapper 读 UTF-8 文件、把该位置换成 "-"（codex exec resume 的 PROMPT 传
-  "-" 即从 stdin 读）——大积压不再撞 Windows 命令行上限（太阳哥 2026-09-01
-  复验原话：撞上是永久重试）
-用法: python wake-taiyang.py exec resume --skip-git-repo-check <session-id> <prompt-file>
+- prompt 走 stdin：门房显式传 --prompt-file <path>，wrapper 读 UTF-8 文件、
+  把该位置换成 "-"（codex exec resume 的 PROMPT 传 "-" 即从 stdin 读）
+  ——大积压不再撞 Windows 命令行上限（太阳哥 2026-09-01 复验原话：撞上是永久重试）
+- fail-closed：见到 --prompt-file 就必须读成功，文件缺失/读失败 exit=2 且
+  绝不启动 codex——路径字符串当 prompt 发出去、exit=0 误 ack 真消息的
+  fail-open 洞（太阳哥 2026-09-01 #227 最终 blocker）。没有 flag 才原样透传
+用法: python wake-taiyang.py exec resume --skip-git-repo-check <session-id> --prompt-file <prompt-file>
 """
 
 import subprocess
@@ -67,27 +69,32 @@ def resolve_codex():
 
 
 def split_prompt_file(args):
-    """最后一个参数是门房落的 prompt 文件（.txt 且存在）→ 读出来走 stdin，
-    该位置换成 "-"；否则原样透传。读文件失败直接 2 退出——prompt 没了
-    不能把空 stdin 喂给 codex 假装无事发生。"""
-    if not args or not args[-1].endswith(".txt"):
+    """门房模式显式传 --prompt-file <path>：见到 flag 就必须读成功——
+    文件缺失/读失败直接 exit(2)，绝不启动 codex（fail-closed；
+    「路径字符串当 prompt 发给 codex、exit=0 误 ack」的 fail-open 洞，
+    太阳哥 2026-09-01 #227）。没有 flag 才原样透传——普通文本恰好
+    以 .txt 结尾也不许被误读成文件。"""
+    if "--prompt-file" not in args:
         return args, None
-    pf = Path(args[-1])
+    i = args.index("--prompt-file")
+    if i + 1 >= len(args):
+        print("[wake-taiyang] --prompt-file 后面没跟路径", file=sys.stderr)
+        sys.exit(2)
+    pf = Path(args[i + 1])
     try:
-        if not pf.is_file():
-            return args, None
-        return args[:-1] + ["-"], pf.read_text(encoding="utf-8")
+        text = pf.read_text(encoding="utf-8")
     except Exception as e:
         print(f"[wake-taiyang] 读 prompt 文件失败 {pf}: {e}", file=sys.stderr)
         sys.exit(2)
+    return args[:i] + ["-"] + args[i + 2:], text
 
 
 def main():
+    args, prompt = split_prompt_file(sys.argv[1:])
     codex = resolve_codex()
     if not codex:
         print("[wake-taiyang] 找不到任何 codex.exe", file=sys.stderr)
         return 127
-    args, prompt = split_prompt_file(sys.argv[1:])
     p = subprocess.run([str(codex)] + args,
                        input=prompt.encode("utf-8") if prompt is not None else None)
     return p.returncode

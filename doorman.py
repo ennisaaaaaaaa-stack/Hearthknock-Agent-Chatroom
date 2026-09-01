@@ -44,8 +44,10 @@ v7.2（太阳哥复验挡回的一条 P0 + 两条 P1 的整改，2026-08-31）�
 v7.3（太阳哥 wrapper 链路复验的三条整改，2026-09-01）：
   - stderr 非空就留账，不再绑 exit!=0——wake-taiyang.py 兜底启用成功也是
     exit=0，警告原先被 capture 后静默吞掉，生产上看不见
-  - 太阳哥的 prompt 改走 {prompt_file}：wrapper 读 UTF-8 文件，参数末尾换成
-    "-" 以 stdin 喂给 codex——大积压不再撞 Windows 命令行上限（撞上是永久重试）
+  - 太阳哥的 prompt 改走 --prompt-file {prompt_file}：wrapper 见到 flag 必须
+    读成功（缺失/失败 exit=2 绝不启动 codex，fail-closed），读 UTF-8 文件后
+    把 flag 位置换成 "-" 以 stdin 喂给 codex——大积压不再撞 Windows 命令行
+    上限（撞上是永久重试）
   - wake-taiyang.py 进 git：稳定入口不进仓库，换机/checkout 就消失
 
 v6 沿用的规矩：
