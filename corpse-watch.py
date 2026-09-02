@@ -19,6 +19,10 @@ v2 接力：死在门房差事上的尸体（wire 开头是门房叫醒包），
 讣告喂给一个新 kimi -p session 接棒（detach，不走门房——门房可能就是死因）。
 接力 session 自己若死了只报丧不接力（RELAY_MARK 防丧葬流水线）。
 
+v3 升级（L3）：接力也死了 = 兜底链断到最后一环，报丧改 @tiexin 升级可见
+（前端 @人类整条高亮）。升级幂等：同一房间 ESCALATE_WINDOW_HOURS 内只
+@tiexin 一次，之后的接力尸体照报但不重复敲门——防尸体风暴刷屏（太阳哥 #239）。
+
 v1 只验 kimi-code 的 session（~/.kimi-code/sessions/）。zhaozhao（Hermes）和
 太阳哥（Codex）的尸体在别的目录，各有各的验法，以后再说。
 """
@@ -41,6 +45,7 @@ FRESH_HOURS = 24     # 只报多久以内的新尸
 TAIL_BYTES = 65536   # 从 wire 尾部读这么多找最后一条 loop 事件
 HEAD_BYTES = 262144  # 从 wire 头部读这么多找门房叫醒包——系统提示和工具清单很大，
                      # 实测叫醒标记出现在 ~70KB 处，64KB 的窗口会恰好差一步
+ESCALATE_WINDOW_HOURS = 6  # L3 升级幂等窗：同房同窗内只 @tiexin 一次
 
 # v2 接力：死在门房差事上的尸体，直接把讣告喂给一个新 session 接手。
 KIMI = Path.home() / ".kimi-code" / "bin" / "kimi.exe"
@@ -60,9 +65,9 @@ def log(msg: str) -> None:
         pass
 
 
-def load_ledger() -> tuple[set, set]:
-    """返回 (已发讣告的 session_id 集, 已报丧的 session_id 集)。"""
-    obituaries, reported = set(), set()
+def load_ledger() -> tuple[set, set, dict]:
+    """返回 (已发讣告的 session_id 集, 已报丧的 session_id 集, L3升级台账{房: epoch})。"""
+    obituaries, reported, escalated = set(), set(), {}
     try:
         for line in LEDGER_FILE.read_text(encoding="utf-8").splitlines():
             try:
@@ -70,17 +75,19 @@ def load_ledger() -> tuple[set, set]:
             except Exception:
                 continue
             sid = rec.get("session_id", "")
-            if not sid:
-                continue
-            if rec.get("type") == "obituary":
+            if rec.get("type") == "obituary" and sid:
                 obituaries.add(sid)
-            elif rec.get("type") == "corpse_reported":
+            elif rec.get("type") == "corpse_reported" and sid:
                 reported.add(sid)
+            elif rec.get("type") == "l3_escalated" and rec.get("room"):
+                # 同房多次升级只留最新一笔——幂等窗拿它和现在比
+                escalated[rec["room"]] = max(escalated.get(rec["room"], 0),
+                                             rec.get("epoch", 0))
     except FileNotFoundError:
         pass
     except Exception as e:
         log(f"台账读取失败（本轮当空台账用）: {e}")
-    return obituaries, reported
+    return obituaries, reported, escalated
 
 
 def append_ledger(rec: dict) -> None:
@@ -132,7 +139,7 @@ def read_cwd(session_dir: Path) -> str:
 
 def find_corpses(now: float):
     """产出 (session_id, wire_path, cwd, 断气时间, tool_name, tool_args) 列表。"""
-    obituaries, reported = load_ledger()
+    obituaries, reported, _ = load_ledger()
     corpses = []
     if not SESSIONS_ROOT.exists():
         return corpses
@@ -234,17 +241,28 @@ def main(dry_run: bool) -> None:
     if not corpses:
         log("巡检一轮：无新尸")
         return
+    _, _, escalated = load_ledger()  # L3 幂等窗对账用（find_corpses 里那趟不管它）
     for sid, wire, cwd, died_at, tool, args in corpses:
         short = sid.replace("session_", "")[:8]
         head = wire_head(wire)
         oroom = origin_room(head)  # 死在哪个房间的差事，讣告就抬进哪个房间
-        text = (
-            f"[仵作·报丧] 发现一具 session 尸体 @mingming\n"
-            f"- session: {short}…\n"
-            f"- 出事房间: 「{oroom}」\n" if oroom else
-            f"[仵作·报丧] 发现一具 session 尸体 @mingming\n"
-            f"- session: {short}…\n"
-        )
+        # L3：接力也死了 → 兜底链断到最后一环，升级 @tiexin（前端 @人类整条高亮）。
+        # 幂等：同房 ESCALATE_WINDOW_HOURS 内只敲一次门，尸体照报但不重复 @
+        is_relay = RELAY_MARK in head
+        esc_room = oroom or ROOM
+        escalate = bool(is_relay and
+                        now - escalated.get(esc_room, 0) > ESCALATE_WINDOW_HOURS * 3600)
+        at_who = "@tiexin" if escalate else "@mingming"
+        kind = "[仵作·升级] 接力也死了" if is_relay else "[仵作·报丧] 发现一具 session 尸体"
+        text = f"{kind} {at_who}\n- session: {short}…\n"
+        if oroom:
+            text += f"- 出事房间: 「{oroom}」\n"
+        if is_relay:
+            import re
+            m = re.search(r"死者:\s*(session_\w+)", head)  # 接力包开头的原死者
+            if m:
+                text += f"- 原始死者: {m.group(1).replace('session_', '')[:8]}…（接棒的不是它）\n"
+            text += "- 这是 L3 升级：L2 接力链也断了，需要人来看一眼。\n"
         text += (
             f"- 工作目录: {cwd or '（读不到）'}\n"
             f"- 断气时间: {died_at}（wire 最后落笔，沉默已超 {STALE_MIN} 分钟）\n"
@@ -255,21 +273,28 @@ def main(dry_run: bool) -> None:
         if dry_run:
             relayable = DOORMAN_MARK in head and RELAY_MARK not in head
             log(f"[dry-run] 发现尸体 {short}（{died_at}，死在 {tool}，房「{oroom}」，"
-                f"{'可接力' if relayable else '只报丧'}）——未投递")
+                f"{'可接力' if relayable else '只报丧'}"
+                f"{'，L3升级@tiexin' if escalate else ''}）——未投递")
             print(text)
             print("---")
             continue
         if post_report(text, room=oroom or ROOM):
             # v2：死在门房差事上的尸体，讣告直接喂给新 session 接力；
-            # 接力 session 自己若死了（RELAY_MARK）只报丧——防丧葬流水线
+            # 接力 session 自己若死了（RELAY_MARK）只报丧+升级——防丧葬流水线
             relayed = False
-            if DOORMAN_MARK in head and RELAY_MARK not in head:
+            if DOORMAN_MARK in head and not is_relay:
                 relayed = spawn_relay(sid, wire, cwd, died_at, tool, args, oroom)
             append_ledger({"type": "corpse_reported", "session_id": sid,
                            "ts": datetime.now().isoformat(timespec="seconds"),
                            "wire": str(wire), "died_at": died_at, "died_doing": tool,
-                           "room": oroom, "relayed": relayed})
-            log(f"报丧已投递「{oroom or ROOM}」：{short}（{died_at}，死在 {tool}{'，已接力' if relayed else ''}）")
+                           "room": oroom, "relayed": relayed, "escalated": escalate})
+            if escalate:
+                append_ledger({"type": "l3_escalated", "room": esc_room,
+                               "ts": datetime.now().isoformat(timespec="seconds"),
+                               "epoch": now, "session_id": sid})
+                escalated[esc_room] = now  # 本轮同房的下一具接力尸不再敲tiexin的门
+            log(f"报丧已投递「{oroom or ROOM}」：{short}（{died_at}，死在 {tool}"
+                f"{'，已接力' if relayed else ''}{'，L3已升级' if escalate else ''}）")
         else:
             log(f"报丧投递失败，下轮重试：{short}")
 
