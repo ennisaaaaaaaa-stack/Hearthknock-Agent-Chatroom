@@ -51,10 +51,15 @@
   }
   .nav-title:first-of-type { border-top: none; }
   .ritem {
-    display: block; width: 100%; text-align: left; cursor: pointer;
+    display: block; width: 100%; text-align: left; cursor: pointer; position: relative;
     background: none; border: none; border-left: 3px solid transparent;
     color: var(--paper); font-family: inherit; font-size: 14px;
     padding: 5px 4px 5px 10px; line-height: 1.4;
+  }
+  /* 通知点：房里有没看过的新消息，亮一粒（参照 spoor 星星——轻，不吵） */
+  .ritem .dot {
+    position: absolute; right: 6px; top: 8px; width: 7px; height: 7px; border-radius: 50%;
+    background: var(--lav); box-shadow: 0 0 8px rgba(184,169,232,0.9);
   }
   .ritem:hover { color: var(--lav); }
   .ritem.on { border-left-color: var(--lav); color: var(--lav); }
@@ -177,6 +182,13 @@
   .msg.me .body { background: rgba(184,169,232,0.10); border-color: rgba(184,169,232,0.35); }
   .msg.sys { align-self: center; max-width: 90%; }
   .msg.sys .body { border-style: dashed; color: var(--mute); font-size: 13px; }
+  /* @到人类 = 叫人：整条强调，紫是家里点名的颜色——叫到谁，就让这条响一点 */
+  .msg.call .body {
+    border-color: rgba(201,167,255,.65); background: rgba(157,127,232,.13);
+    box-shadow: 0 0 12px rgba(201,167,255,.25);
+  }
+  .msg.call .meta b { color: #d6bdff; }
+  .msg .body .at { color: #d6bdff; font-weight: 600; }
 
   footer { display: flex; gap: 10px; padding: 12px 32px 16px; border-top: 1px solid var(--panel-edge); align-items: flex-end; }
   footer textarea {
@@ -330,16 +342,37 @@ $('#create-room').onclick = async () => {
   switchRoom(name);
 };
 
+// @人类 = 叫人，整条强调；@任何住户 = 名字点亮。
+// fillText 全程走文本节点，不碰 innerHTML——消息内容是别人写的，渲染不许开门
+const AT_NAMES = () => [...roster.humans, ...roster.agents]
+  .filter(n => n && !isSysSender(n)).sort((a, b) => b.length - a.length);
+const mentionsHuman = t => roster.humans.some(h => h && (t || '').includes('@' + h));
+function fillText(el, text) {
+  const names = AT_NAMES();
+  if (!names.length || !text) { el.textContent = text || ''; return; }
+  const re = new RegExp('@(?:' + names.map(n => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')', 'g');
+  let last = 0, m;
+  while ((m = re.exec(text))) {
+    el.append(text.slice(last, m.index));
+    const s = document.createElement('span');
+    s.className = 'at'; s.textContent = m[0];
+    el.appendChild(s);
+    last = m.index + m[0].length;
+  }
+  el.append(text.slice(last));
+}
+
 function addMsg(m) {
   const isSys = isSysSender(m.sender);
   const div = document.createElement('div');
   div.className = 'msg' + (isSys ? ' sys' : (m.sender === me() ? ' me' : ''));
+  if (!isSys && mentionsHuman(m.text)) div.classList.add('call');
   const meta = document.createElement('div');
   meta.className = 'meta';
   const b = document.createElement('b'); b.textContent = m.sender;
   meta.appendChild(b); meta.append(m.ts);
   const body = document.createElement('div');
-  body.className = 'body'; body.textContent = m.text;
+  body.className = 'body'; fillText(body, m.text);
   if (m.file) {
     const att = document.createElement('div');
     att.className = 'att';
@@ -376,6 +409,11 @@ function roomItem(r) {
   const label = document.createElement('span');
   label.textContent = r.room;
   b.appendChild(label);
+  if (r.room !== room && (r.count || 0) > (seen[r.room] || 0)) {
+    const d = document.createElement('span');
+    d.className = 'dot';
+    b.appendChild(d);
+  }
   const meta = document.createElement('span');
   meta.className = 'rmeta';
   const bits = [];
@@ -428,11 +466,24 @@ $('#ws-hide').onclick = () => setWsCollapsed(true);
 $('#ws-show').onclick = () => setWsCollapsed(false);
 setWsCollapsed(localStorage.getItem('cr_ws_collapsed') === '1');  // 刷新后记住上次的折叠状态
 
+// 通知点台账：每房记「看到第几条」（按 count 对账），存 localStorage。
+// 首装不补灯——没有台账时全标已读，不然第一次开屏满天星
+let seen = {};
+try { seen = JSON.parse(localStorage.getItem('cr_seen') || '{}'); } catch (e) {}
+function syncSeen(list) {
+  const firstRun = !localStorage.getItem('cr_seen');
+  list.forEach(r => {
+    if (firstRun || r.room === room) seen[r.room] = r.count || 0;
+  });
+  localStorage.setItem('cr_seen', JSON.stringify(seen));
+}
+
 async function loadRooms() {
   const d = await api('/api/rooms');
   roomsData = d.rooms;
   if (!roomsData.find(r => r.room === room))
     roomsData.push({room, members: [], state: 'open', count: 0, est_tokens: 0});
+  syncSeen(roomsData);
   const open = roomsData.filter(r => r.state !== 'closed');
   const closed = roomsData.filter(r => r.state === 'closed');
   // 不含人类的限定房 = agent 们自己的房：显示但不打扰——默认折叠，
