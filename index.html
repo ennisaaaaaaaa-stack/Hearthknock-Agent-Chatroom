@@ -118,6 +118,32 @@
     border: 1px solid var(--panel-edge); border-radius: 99px; padding: 1px 8px; color: var(--paper);
   }
   #settings .chip .x { color: var(--warn); cursor: pointer; margin-left: 5px; }
+  /* ---------- 工作区面板：谁决策谁更新，hearth账本的一页 ---------- */
+  #ws-panel { border-bottom: 1px solid var(--panel-edge); background: rgba(12,11,16,.4); font-size: 12.5px; }
+  #ws-panel summary {
+    padding: 7px 32px; cursor: pointer; color: var(--mute); user-select: none; list-style: none;
+  }
+  #ws-panel summary::-webkit-details-marker { display: none; }
+  #ws-panel summary::before { content: '▸ '; }
+  #ws-panel[open] summary::before { content: '▾ '; }
+  #ws-panel summary:hover { color: var(--lav); }
+  #ws-panel #ws-meta { color: var(--mute); opacity: .75; margin-left: 8px; font-size: 11.5px; }
+  #ws-body { padding: 0 32px 10px; }
+  #ws-content {
+    margin: 0; white-space: pre-wrap; word-break: break-word; color: var(--paper);
+    font-family: inherit; line-height: 1.6; max-height: 40vh; overflow-y: auto;
+  }
+  #ws-content.empty { color: var(--mute); }
+  #ws-body textarea {
+    width: 100%; min-height: 160px; box-sizing: border-box; resize: vertical;
+    background: rgba(10,10,12,.6); color: var(--paper); border: 1px solid var(--panel-edge);
+    border-radius: 6px; padding: 8px; font-family: inherit; font-size: 12.5px; line-height: 1.6;
+  }
+  #ws-body button {
+    background: none; border: 1px solid var(--panel-edge); color: var(--lav);
+    border-radius: 6px; padding: 2px 10px; cursor: pointer; font-family: inherit; font-size: 12px; margin-top: 6px; margin-right: 6px;
+  }
+  #ws-body button:hover { border-color: var(--lav); }
   #settings button.act {
     background: none; border: 1px solid rgba(232,193,105,.4); color: var(--warn);
     border-radius: 6px; padding: 2px 10px; cursor: pointer; font-family: inherit; font-size: 12.5px;
@@ -211,6 +237,16 @@
     <div id="parentline"></div>
   </div>
   <div id="settings"></div>
+  <details id="ws-panel"><summary>📋 工作区<span id="ws-meta"></span></summary>
+    <div id="ws-body">
+      <pre id="ws-content"></pre>
+      <div id="ws-edit" style="display:none">
+        <textarea id="ws-text"></textarea>
+        <button id="ws-save">保存</button><button id="ws-cancel">取消</button>
+      </div>
+      <button id="ws-editbtn">编辑</button>
+    </div>
+  </details>
   <div id="log"></div>
   <div id="pending-file"><span id="pf-name"></span><span class="x" id="pf-x">✕ 移除</span></div>
   <footer id="foot">
@@ -340,6 +376,36 @@ function roomItem(r) {
   return b;
 }
 
+async function loadWorkspace() {
+  // 工作区面板：谁决策谁更新（读谁都能读；写带署名）。面板只折叠不隐藏——账本要随时能看。
+  const c = $('#ws-content');
+  try {
+    const d = await api('/api/workspace?room=' + encodeURIComponent(room));
+    if (d.error || d.content === undefined) {
+      c.textContent = '（这间房还没有工作区）'; c.className = 'empty';
+      $('#ws-meta').textContent = '';
+    } else {
+      c.textContent = d.content || '（空——决定/待办/进度写在这里，谁决策谁更新）';
+      c.className = d.content ? '' : 'empty';
+      $('#ws-meta').textContent = d.updated_ts ? `${d.updated_by || '?'} 更新于 ${d.updated_ts}` : '';
+    }
+    $('#ws-edit').style.display = 'none'; c.style.display = ''; $('#ws-editbtn').style.display = '';
+  } catch (e) { c.textContent = '（工作区读不到）'; c.className = 'empty'; }
+}
+$('#ws-editbtn').onclick = () => {
+  $('#ws-text').value = $('#ws-content').className === 'empty' ? '' : $('#ws-content').textContent;
+  $('#ws-content').style.display = 'none'; $('#ws-edit').style.display = ''; $('#ws-editbtn').style.display = 'none';
+};
+$('#ws-cancel').onclick = () => {
+  $('#ws-edit').style.display = 'none'; $('#ws-content').style.display = ''; $('#ws-editbtn').style.display = '';
+};
+$('#ws-save').onclick = async () => {
+  await api('/api/workspace', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({room, content: $('#ws-text').value, updated_by: me() || '前端'})});
+  $('#ws-edit').style.display = 'none'; $('#ws-content').style.display = ''; $('#ws-editbtn').style.display = '';
+  loadWorkspace();
+};
+
 async function loadRooms() {
   const d = await api('/api/rooms');
   roomsData = d.rooms;
@@ -361,6 +427,7 @@ async function loadRooms() {
   const cl = $('#closed-list'); cl.innerHTML = '';
   closed.forEach(r => cl.appendChild(roomItem(r)));
   renderRoomState();
+  loadWorkspace();
 }
 
 function renderRoomState() {
