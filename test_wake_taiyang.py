@@ -9,6 +9,8 @@
    ghost session/坏模型都是 exit=0 假成功）：exec 模式强制 --json，
    exit=0 且本轮有 turn.completed 才算醒；turn.failed / 无 completed /
    非零 rc 一律 exit=3（不 ack）；非 exec 用法原样透传
+5. stdout 流式收集（债①）：~8MB 输出 + 大 stdin 同时跑不互堵、终态照判
+6. 杀树 job（债②）：真 child 挂得进 KILL_ON_JOB_CLOSE job；非 Windows 放行
 
 跑法：python test_wake_taiyang.py
 """
@@ -181,6 +183,40 @@ with tempfile.TemporaryDirectory() as td:
         b'garbage\n{"type":"thread.started","thread_id":"abc"}\n{"type":"turn.completed"}\n{"broken\n')
     check("4f parse_turn_events", types == {"thread.started", "turn.completed"} and tid == "abc",
           f"types={types} tid={tid}")
+
+    # --- 5. 流式收集（债①）：超大 stdout 不整包缓冲、不互堵、终态照判 ---
+    f_big = fake_with(
+        "import sys\n"
+        "line = '{\"type\":\"item.completed\",\"item\":{\"text\":\"" + "x" * 3800 + "\"}}'\n"
+        "for _ in range(2000):\n"  # ~8MB，远超管道缓冲和旧整包缓冲的胃口
+        "    print(line)\n"
+        "sys.stdout.flush()\n"
+        "data = sys.stdin.buffer.read()\n"  # 同时验 stdin 喂饭线程不和 stdout 互堵
+        "assert len(data) > 100000\n"
+        "print('{\"type\":\"turn.completed\",\"usage\":{}}')\n",
+        "fake_big.py")
+    rc = run_fake(f_big, ["exec", "--skip-git-repo-check", "hi",
+                          "--prompt-file", str(pf)])
+    check("5a 8MB 流式+大 stdin 不互堵 exit=0", rc == 0, f"rc={rc}")
+
+    # --- 6. 杀树 job（债②）：Windows 上真 child 能挂进 job；别处放行 None ---
+    import subprocess as _sp
+    proc = _sp.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                     stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+    try:
+        job = wt.assign_kill_on_close_job(proc)
+        if os.name == "nt":
+            check("6a Windows 挂 job 成功", bool(job), f"job={job}")
+        else:
+            check("6a 非 Windows 放行 None", job is None, f"job={job}")
+    finally:
+        proc.kill()
+        proc.wait()
+    # 逐行解析单元
+    t, tid = wt.parse_event_line(b'{"type":"thread.started","thread_id":"z9"}\n')
+    t2, _ = wt.parse_event_line(b'not json')
+    check("6b parse_event_line", t == "thread.started" and tid == "z9" and t2 is None,
+          f"t={t} tid={tid} t2={t2}")
 
 print()
 if fails:

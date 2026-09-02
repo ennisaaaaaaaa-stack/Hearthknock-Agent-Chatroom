@@ -22,12 +22,18 @@
   exit=3（门房不 ack，下轮巡逻重投，at-least-once 不变）。
   注意 turn 里的 item.completed type=error（WebSocket  fallback 噪音）不算失败，
   判据只认 turn.completed / turn.failed 两个终态事件。
+- stdout 流式收集（太阳哥 #253 债①）：逐行边收边吐边判，不再整包双重缓冲，
+  超长 turn 不吃内存
+- 杀整棵进程树（太阳哥 #253 债②）：codex 挂进 KILL_ON_JOB_CLOSE 的 Job Object，
+  wrapper 被门房 900s 超时杀掉时整棵树陪葬，不再留孤儿 codex.exe
 用法: python wake-taiyang.py exec resume --skip-git-repo-check <session-id> --prompt-file <prompt-file>
 """
 
 import json
+import os
 import subprocess
 import sys
+import threading
 import tomllib
 from pathlib import Path
 
@@ -97,25 +103,99 @@ def split_prompt_file(args):
     return args[:i] + ["-"] + args[i + 2:], text
 
 
+def parse_event_line(line):
+    """单行（bytes/str）→ (事件 type or None, thread_id or None)。
+    非 JSON 行（警告等）跳过。流式收集的逐行入口。"""
+    if isinstance(line, bytes):
+        line = line.decode("utf-8", errors="replace")
+    line = line.strip()
+    if not line.startswith("{"):
+        return None, None
+    try:
+        ev = json.loads(line)
+    except json.JSONDecodeError:
+        return None, None
+    t = ev.get("type")
+    tid = ev.get("thread_id") if t == "thread.started" else None
+    return t, tid
+
+
 def parse_turn_events(raw):
-    """从 codex --json 的 stdout（JSONL bytes）里收事件 type。
-    非 JSON 行（警告等）跳过。返回 (types set, thread_id or None)。"""
+    """从整段 JSONL bytes 里收事件 type。返回 (types set, thread_id or None)。
+    （逐行版 parse_event_line 的批量壳，单测和离线分析用）"""
     types = set()
     thread_id = None
-    for line in raw.decode("utf-8", errors="replace").splitlines():
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            ev = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        t = ev.get("type")
+    for line in raw.splitlines():
+        t, tid = parse_event_line(line)
         if t:
             types.add(t)
-        if t == "thread.started" and ev.get("thread_id"):
-            thread_id = ev["thread_id"]
+        if tid:
+            thread_id = tid
     return types, thread_id
+
+
+def assign_kill_on_close_job(proc):
+    """把 child 挂进 Windows Job Object（KILL_ON_JOB_CLOSE）：wrapper 一旦被
+    门房 900s 超时杀掉，job 句柄随 wrapper 尸体关闭，OS 自动杀整棵进程树
+    （太阳哥 2026-09-02 #253 债②——以前只杀 wrapper，codex.exe 孤儿漏网）。
+    非 Windows / 任何一步失败都留账放行：杀树是善后增强，不许挡点火主链。"""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+        JobObjectExtendedLimitInformation = 9
+
+        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
+                        ("PerJobUserTimeLimit", ctypes.c_int64),
+                        ("LimitFlags", wintypes.DWORD),
+                        ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t),
+                        ("ActiveProcessLimit", wintypes.DWORD),
+                        ("Affinity", ctypes.c_size_t),
+                        ("PriorityClass", wintypes.DWORD),
+                        ("SchedulingClass", wintypes.DWORD)]
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [(n, ctypes.c_uint64) for n in
+                        ("ReadOperationCount", "WriteOperationCount",
+                         "OtherOperationCount", "ReadTransferCount",
+                         "WriteTransferCount", "OtherTransferCount")]
+
+        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                        ("IoInfo", IO_COUNTERS),
+                        ("ProcessMemoryLimit", ctypes.c_size_t),
+                        ("JobMemoryLimit", ctypes.c_size_t),
+                        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        k32 = ctypes.windll.kernel32
+        job = k32.CreateJobObjectW(None, None)
+        if not job:
+            print("[wake-taiyang] CreateJobObject 失败，杀树兜底没挂上", file=sys.stderr)
+            return None
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not k32.SetInformationJobObject(
+                wintypes.HANDLE(job), JobObjectExtendedLimitInformation,
+                ctypes.byref(info), ctypes.sizeof(info)):
+            print("[wake-taiyang] SetInformationJobObject 失败，杀树兜底没挂上", file=sys.stderr)
+            k32.CloseHandle(wintypes.HANDLE(job))
+            return None
+        if not k32.AssignProcessToJobObject(wintypes.HANDLE(job),
+                                            wintypes.HANDLE(proc._handle)):
+            print("[wake-taiyang] AssignProcessToJobObject 失败（可能已在别的 job 里），"
+                  "杀树兜底没挂上", file=sys.stderr)
+            k32.CloseHandle(wintypes.HANDLE(job))
+            return None
+        return job  # 句柄刻意不关：跟着 wrapper 的命走，wrapper 死=树死
+    except Exception as e:
+        print(f"[wake-taiyang] 挂杀树 job 失败: {e}（放行，不挡点火）", file=sys.stderr)
+        return None
 
 
 def main():
@@ -131,20 +211,41 @@ def main():
         return p.returncode
     if "--json" not in args:
         args = args + ["--json"]
-    # stdout 抓来判 turn 终态，判完原样吐回（门房日志链路不变）；stderr 让 child 直接继承
-    p = subprocess.run([str(codex)] + args,
-                       input=prompt.encode("utf-8") if prompt is not None else None,
-                       stdout=subprocess.PIPE)
-    sys.stdout.buffer.write(p.stdout)
-    sys.stdout.buffer.flush()
-    types, thread_id = parse_turn_events(p.stdout)
+    # 流式收集（太阳哥 2026-09-02 #253 债①）：以前 subprocess.run 整包双重缓冲，
+    # 超长 turn 把全部 JSONL 压在内存里；现在逐行读，边收边原样吐回（门房日志
+    # 链路不变），事件终态逐行判。stderr 让 child 直接继承。
+    p = subprocess.Popen([str(codex)] + args,
+                         stdin=subprocess.PIPE if prompt is not None else None,
+                         stdout=subprocess.PIPE)
+    if prompt is not None:
+        # stdin 太大时同步写会和孩子吐 stdout 互堵，喂饭走旁路线程
+        data = prompt.encode("utf-8")
+        def _feed():
+            try:
+                p.stdin.write(data)
+                p.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass  # 孩子早夭，饭倒了，rc 会告诉我们
+        threading.Thread(target=_feed, daemon=True).start()
+    assign_kill_on_close_job(p)
+    types = set()
+    thread_id = None
+    for line in p.stdout:
+        sys.stdout.buffer.write(line)
+        sys.stdout.buffer.flush()
+        t, tid = parse_event_line(line)
+        if t:
+            types.add(t)
+        if tid:
+            thread_id = tid
+    rc = p.wait()
     if thread_id:
         print(f"[wake-taiyang] thread_id={thread_id}", file=sys.stderr)
-    if p.returncode == 0 and "turn.completed" in types and "turn.failed" not in types:
+    if rc == 0 and "turn.completed" in types and "turn.failed" not in types:
         return 0
     # 不信 exit code：turn.failed 或无 completed 一律 exit=3（不 ack，等重投）。
     # 原始非零 rc 记进 stderr 留账，对外只认 3——门房侧「非零即失败」语义不变
-    print(f"[wake-taiyang] 本轮没有 turn.completed（rc={p.returncode}, "
+    print(f"[wake-taiyang] 本轮没有 turn.completed（rc={rc}, "
           f"events={sorted(types) or '无'}），按失败 exit=3", file=sys.stderr)
     return 3
 
