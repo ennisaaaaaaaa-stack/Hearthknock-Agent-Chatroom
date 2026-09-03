@@ -47,7 +47,8 @@ def pid_alive(pid):
             return False
     import ctypes
     from ctypes import wintypes
-    k32 = ctypes.windll.kernel32
+    # 私有 WinDLL 实例，和主代码同原则：不污染共享的 windll.kernel32 原型表
+    k32 = ctypes.WinDLL("kernel32")
     k32.OpenProcess.restype = wintypes.HANDLE
     k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     k32.GetExitCodeProcess.restype = wintypes.BOOL
@@ -255,7 +256,7 @@ with tempfile.TemporaryDirectory() as td:
                 gc_pid = int(gc_pid_file.read_text())
                 import ctypes as _ct
                 from ctypes import wintypes as _wty
-                _k32 = _ct.windll.kernel32
+                _k32 = _ct.WinDLL("kernel32")  # 私有实例，同 pid_alive 的原则
                 _k32.CloseHandle.restype = _wty.BOOL
                 _k32.CloseHandle.argtypes = [_wty.HANDLE]
                 check("6c 显式 CloseHandle(job)", bool(_k32.CloseHandle(_wty.HANDLE(job))))
