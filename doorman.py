@@ -2,6 +2,15 @@
 """
 门房 (doorman) v7 —— 客厅的门卫：有新消息就把对应 runtime 拉起来。
 
+v7.7（zhaozhao模板轮审的三条整改，2026-09-03）：
+  - 成员级叫醒模板覆盖：members.<name>.prompt_template 存在就用它，否则用全局
+    prompt_template——hermes 的传输层（curl/上传/编码）wrapper 已包，叫醒词裁到五条款
+  - 双轨大括号钉注释：cmd/模板里 {x} 是门房 format 时替换的；写给 agent 看的
+    JSON 示例必须 {{...}} 双大括号转义，渲染后才剩单层（见 doorman.json template_note）
+  - 基础设施账号（门房/仵作）只在 agents 列表，不进 members：parse_mentions 只扫
+    members，@ 它们匹配不到任何叫醒目标，自然落空；members 里挂 cmd:null 反而会
+    混进「没有无头入口」的巡检日志噪音。说明落在 doorman.json infra_accounts
+
 v7（游标台账进hearth；太阳哥审 v6 两条 P0 的整改，2026-08-30）：
   - 游标从门房本地 state 文件迁进 server 的 cursors 表。state 文件丢了
     只丢节流记录和报警去重，最坏多叫几轮——不再表现为「失忆装初来乍到」
@@ -246,6 +255,10 @@ def build_prompt(cfg, member, room, msgs=None, closing=False, overflow=0):
         prompt = cfg["summary_template"].format(member=member, room=room, server=server)
     else:
         lines = []
+        # 成员可用自己的叫醒模板（members.<name>.prompt_template）覆盖全局模板——
+        # 不同 runtime 的通路层能力不同（hermes 的传输已由 wrapper 包了），
+        # 同一条指令只活在一处，裁剪版也只活在那一个成员的 spec 里
+        tpl = spec.get("prompt_template") or cfg["prompt_template"]
         if overflow:
             # 分批投：这轮只装最早的一批，ack 只认到本包末条——剩下的游标没越过，
             # 门房下轮会接着叫接着送，不用抢救；想一口气读完也可以自己拉
@@ -259,8 +272,8 @@ def build_prompt(cfg, member, room, msgs=None, closing=False, overflow=0):
                 f = m["file"]
                 s += f"\n  （附件: {f['fname']} · {f['mime']} · {f['size']}B → 下载: curl -s -o 文件名 {server}/api/files/{f['id']}）"
             lines.append(s)
-        prompt = cfg["prompt_template"].format(member=member, room=room, server=server,
-                                               messages="\n".join(lines))
+        prompt = tpl.format(member=member, room=room, server=server,
+                            messages="\n".join(lines))
     conv = cfg.get("conventions")
     if conv:  # 约定随包投递：谁醒来都读得到家规。{server} 手工替换，不走 format（正文里有大括号）
         prompt += "\n\n【hearth约定】\n" + conv.replace("{server}", server)
@@ -514,7 +527,7 @@ def main():
         state.setdefault(k, {} if k in ("last_wake", "wake_log") else [])
     state.pop("cursors", None)  # v6 遗存：游标已由 migrate_cursors_v7.py 迁进hearth台账，本地这份从此作废
 
-    log(f"门房 v7.4 上岗（游标台账在hearth，写游标 = prepare 签发投递单 + ack 确认单），房间动态从 server 拉取，每 {cfg['poll_seconds']}s 巡一次")
+    log(f"门房 v7.7 上岗（游标台账在hearth，写游标 = prepare 签发投递单 + ack 确认单），房间动态从 server 拉取，每 {cfg['poll_seconds']}s 巡一次")
     while True:
         now = time.time()
         # 心跳是看门人的命：进程活着但循环死了（僵尸）这件事已经发生过。
