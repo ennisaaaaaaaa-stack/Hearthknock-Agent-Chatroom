@@ -10,7 +10,8 @@
    exit=0 且本轮有 turn.completed 才算醒；turn.failed / 无 completed /
    非零 rc 一律 exit=3（不 ack）；非 exec 用法原样透传
 5. stdout 流式收集（债①）：~8MB 输出 + 大 stdin 同时跑不互堵、终态照判
-6. 杀树 job（债②）：真 child 挂得进 KILL_ON_JOB_CLOSE job；非 Windows 放行
+6. 杀树 job（债②）：真杀树行为验收——child 挂 job 后生 grandchild，显式
+   CloseHandle 触发 KILL_ON_JOB_CLOSE，父子两 PID 都必须死；非 Windows 放行
 
 跑法：python test_wake_taiyang.py
 """
@@ -34,6 +35,31 @@ def check(name, cond, detail=""):
     print(("PASS " if cond else "FAIL ") + name + ((" | " + str(detail)) if detail and not cond else ""))
     if not cond:
         fails += 1
+
+
+def pid_alive(pid):
+    """进程还活着吗。Windows：OpenProcess + GetExitCodeProcess；别处 os.kill(pid, 0)。"""
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.windll.kernel32
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.GetExitCodeProcess.restype = wintypes.BOOL
+    k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return False
+    code = wintypes.DWORD()
+    k32.GetExitCodeProcess(h, ctypes.byref(code))
+    k32.CloseHandle(h)
+    return code.value == 259  # STILL_ACTIVE
 
 
 def run_main(argv):
@@ -199,19 +225,63 @@ with tempfile.TemporaryDirectory() as td:
                           "--prompt-file", str(pf)])
     check("5a 8MB 流式+大 stdin 不互堵 exit=0", rc == 0, f"rc={rc}")
 
-    # --- 6. 杀树 job（债②）：Windows 上真 child 能挂进 job；别处放行 None ---
+    # --- 6. 杀树 job（债②）：真杀树行为验收（太阳哥 2026-09-03 37610a8 轮审②）---
+    # child 挂进 job 后才放生 grandchild（发令枪文件，消除 assign 前的抢跑窗口，
+    # 保证孙辈 deterministic 地落在 job 里），然后显式 CloseHandle(job) 模拟
+    # wrapper 暴毙时句柄随尸体关闭——父子两个 PID 都必须死。「杀整棵树」验的是
+    # 行为，不是 assign 的返回值。
     import subprocess as _sp
-    proc = _sp.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
-                     stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
-    try:
-        job = wt.assign_kill_on_close_job(proc)
-        if os.name == "nt":
+    import time as _time
+    if os.name == "nt":
+        go_file = td / "go"
+        gc_pid_file = td / "gc.pid"
+        child = _sp.Popen([sys.executable, "-c",
+            "import subprocess, sys, time, pathlib\n"
+            f"go = pathlib.Path(r'{go_file}')\n"
+            "while not go.exists():\n"
+            "    time.sleep(0.05)\n"
+            "gc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+            f"pathlib.Path(r'{gc_pid_file}').write_text(str(gc.pid))\n"
+            "time.sleep(60)\n"],
+            stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+        try:
+            job = wt.assign_kill_on_close_job(child)
             check("6a Windows 挂 job 成功", bool(job), f"job={job}")
-        else:
-            check("6a 非 Windows 放行 None", job is None, f"job={job}")
-    finally:
-        proc.kill()
-        proc.wait()
+            if job:
+                go_file.touch()  # 发令：child 此刻才生 grandchild，孙辈落在 job 里
+                deadline = _time.time() + 10
+                while not gc_pid_file.exists() and _time.time() < deadline:
+                    _time.sleep(0.1)
+                gc_pid = int(gc_pid_file.read_text())
+                import ctypes as _ct
+                from ctypes import wintypes as _wty
+                _k32 = _ct.windll.kernel32
+                _k32.CloseHandle.restype = _wty.BOOL
+                _k32.CloseHandle.argtypes = [_wty.HANDLE]
+                check("6c 显式 CloseHandle(job)", bool(_k32.CloseHandle(_wty.HANDLE(job))))
+                try:
+                    child.wait(timeout=10)
+                    child_dead = True
+                except _sp.TimeoutExpired:
+                    child_dead = False
+                check("6d child 被 KILL_ON_JOB_CLOSE 杀掉", child_dead,
+                      f"pid={child.pid}")
+                deadline = _time.time() + 10
+                while pid_alive(gc_pid) and _time.time() < deadline:
+                    _time.sleep(0.2)
+                check("6e grandchild 陪葬（整棵树都死）", not pid_alive(gc_pid),
+                      f"gc_pid={gc_pid}")
+        finally:
+            child.kill()  # 断言失败也别留 60s 的活口
+            child.wait()
+    else:
+        proc = _sp.Popen([sys.executable, "-c", "import time; time.sleep(5)"],
+                         stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+        try:
+            check("6a 非 Windows 放行 None", wt.assign_kill_on_close_job(proc) is None)
+        finally:
+            proc.kill()
+            proc.wait()
     # 逐行解析单元
     t, tid = wt.parse_event_line(b'{"type":"thread.started","thread_id":"z9"}\n')
     t2, _ = wt.parse_event_line(b'not json')

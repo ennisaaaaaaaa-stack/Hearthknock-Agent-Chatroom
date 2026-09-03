@@ -173,7 +173,20 @@ def assign_kill_on_close_job(proc):
                         ("PeakProcessMemoryUsed", ctypes.c_size_t),
                         ("PeakJobMemoryUsed", ctypes.c_size_t)]
 
-        k32 = ctypes.windll.kernel32
+        # 钉 WinAPI 原型（太阳哥 2026-09-03 37610a8 轮审①）：ctypes 默认
+        # restype=c_int，64 位下 HANDLE 返回值会被截成 32 位——句柄高位一丢，
+        # 后面每次调用都在操作一个假句柄。restype/argtypes 必须显式钉死。
+        # 用私有 WinDLL 实例，不污染共享的 windll.kernel32 原型表。
+        k32 = ctypes.WinDLL("kernel32")
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+        k32.SetInformationJobObject.restype = wintypes.BOOL
+        k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                                ctypes.c_void_p, wintypes.DWORD]
+        k32.AssignProcessToJobObject.restype = wintypes.BOOL
+        k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        k32.CloseHandle.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
         job = k32.CreateJobObjectW(None, None)
         if not job:
             print("[wake-taiyang] CreateJobObject 失败，杀树兜底没挂上", file=sys.stderr)
@@ -181,16 +194,15 @@ def assign_kill_on_close_job(proc):
         info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         if not k32.SetInformationJobObject(
-                wintypes.HANDLE(job), JobObjectExtendedLimitInformation,
+                job, JobObjectExtendedLimitInformation,
                 ctypes.byref(info), ctypes.sizeof(info)):
             print("[wake-taiyang] SetInformationJobObject 失败，杀树兜底没挂上", file=sys.stderr)
-            k32.CloseHandle(wintypes.HANDLE(job))
+            k32.CloseHandle(job)
             return None
-        if not k32.AssignProcessToJobObject(wintypes.HANDLE(job),
-                                            wintypes.HANDLE(proc._handle)):
+        if not k32.AssignProcessToJobObject(job, wintypes.HANDLE(proc._handle)):
             print("[wake-taiyang] AssignProcessToJobObject 失败（可能已在别的 job 里），"
                   "杀树兜底没挂上", file=sys.stderr)
-            k32.CloseHandle(wintypes.HANDLE(job))
+            k32.CloseHandle(job)
             return None
         return job  # 句柄刻意不关：跟着 wrapper 的命走，wrapper 死=树死
     except Exception as e:
@@ -227,6 +239,10 @@ def main():
             except (BrokenPipeError, OSError):
                 pass  # 孩子早夭，饭倒了，rc 会告诉我们
         threading.Thread(target=_feed, daemon=True).start()
+    # TODO(非阻断，太阳哥 2026-09-03 37610a8 轮审)：Popen 后再 assign 有极短
+    # 抢跑窗口——child 若在 assign 前抢先 fork 出子进程，早产孙辈漏在 job 外，
+    # 杀树时漏网。codex 实测真抢跑了再升级 CREATE_SUSPENDED → assign →
+    # ResumeThread（创建即挂起，挂进 job 后再放行）。
     assign_kill_on_close_job(p)
     types = set()
     thread_id = None
