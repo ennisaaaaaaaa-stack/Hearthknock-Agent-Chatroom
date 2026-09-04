@@ -12,11 +12,17 @@
 5. stdout 流式收集（债①）：~8MB 输出 + 大 stdin 同时跑不互堵、终态照判
 6. 杀树 job（债②）：真杀树行为验收——child 挂 job 后生 grandchild，显式
    CloseHandle 触发 KILL_ON_JOB_CLOSE，父子两 PID 都必须死；非 Windows 放行
+7. L2 状态机（太阳哥 2026-09-05 #293 打回后点名的测试清单）：坏指针不 fresh、
+   fresh 失败两轮只生一个且进 4、recovered turn_failed 能终止、rc1 无事件
+   不换指针、ghost 真签名保留、episode attempts 持久化与用尽、试住成功洗回
+8. doorman l3_alert（#293 P1）：POST 失败不记 6h 账不落盘、可立即重试；
+   成功才记账并原子落盘；6h 幂等不刷屏
 
 跑法：python test_wake_taiyang.py
 """
 
 import importlib.util
+import json as _json
 import os
 import sys
 import tempfile
@@ -288,6 +294,168 @@ with tempfile.TemporaryDirectory() as td:
     t2, _ = wt.parse_event_line(b'not json')
     check("6b parse_event_line", t == "thread.started" and tid == "z9" and t2 is None,
           f"t={t} tid={tid} t2={t2}")
+
+# --- 7. L2 状态机（太阳哥 2026-09-05 #293 打回后点名的测试清单） ---
+# run_exec 全部用剧本替身：按调用顺序弹 (rc, types, tid)，记录是 resume 还是 fresh。
+def run_l2(td, script, session_content="__missing__"):
+    """session_content: dict 写 JSON / str 原样写（造坏文件）/ "__missing__" 不写。
+    返回 (rc, calls, session 读出值, 原始文件内容)。"""
+    sf = td / "sess.json"
+    if session_content != "__missing__":
+        if isinstance(session_content, dict):
+            sf.write_text(_json.dumps(session_content, ensure_ascii=False), encoding="utf-8")
+        else:
+            sf.write_text(session_content, encoding="utf-8")
+    pf = td / "prompt.txt"
+    pf.write_text("叫醒包", encoding="utf-8")
+    calls = []
+    scripted = list(script)
+    old_run_exec, old_resolve, old_ws = wt.run_exec, wt.resolve_codex, wt.fetch_workspace
+    wt.resolve_codex = lambda: Path(sys.executable)
+    wt.fetch_workspace = lambda room: ""
+
+    def fake_run_exec(codex, args, prompt):
+        calls.append("resume" if "resume" in args else "fresh")
+        return scripted.pop(0)
+
+    wt.run_exec = fake_run_exec
+    try:
+        rc = run_main(["exec", "--skip-git-repo-check",
+                       "--session-file", str(sf), "--room", "测试房",
+                       "--prompt-file", str(pf)])
+    finally:
+        wt.run_exec, wt.resolve_codex, wt.fetch_workspace = old_run_exec, old_resolve, old_ws
+    raw = sf.read_text(encoding="utf-8") if sf.exists() else None
+    try:
+        sess = _json.loads(raw) if raw else None
+    except Exception:
+        sess = raw
+    return rc, calls, sess, raw
+
+
+with tempfile.TemporaryDirectory() as td7:
+    td7 = Path(td7)
+
+    # 7a 坏指针不 fresh（P0-1）：fail-closed exit=4，child 一次没点，坏文件原样留着
+    rc, calls, sess, raw = run_l2(td7, [], session_content="{ 这不是 json")
+    res = _json.loads((td7 / "sess.json.result.json").read_text(encoding="utf-8"))
+    check("7a 坏指针 exit=4 不点火不换身份",
+          rc == 4 and calls == [] and raw == "{ 这不是 json"
+          and res.get("failure_class") == "session_corrupt",
+          f"rc={rc} calls={calls} raw={raw!r} res={res}")
+
+    # 7b rc=1 无事件不换指针（P0-3 收窄）：retry_same exit=3，不 fresh，指针原样
+    rc, calls, sess, _ = run_l2(td7, [(1, set(), None)],
+                                session_content={"thread_id": "old", "recovered": False})
+    check("7b rc1无事件 → 3 不换指针",
+          rc == 3 and calls == ["resume"] and sess.get("thread_id") == "old"
+          and not sess.get("recovered") and "recovery" not in sess,
+          f"rc={rc} calls={calls} sess={sess}")
+
+    # 7c 真 ghost（rc=0 零事件）通路保留：降级 fresh，成功 → 新指针 recovered=true
+    rc, calls, sess, _ = run_l2(td7, [(0, set(), None),
+                                      (0, {"thread.started", "turn.completed"}, "new1")],
+                                session_content={"thread_id": "old", "recovered": False})
+    check("7c ghost → fresh 成功 recovered=true",
+          rc == 0 and calls == ["resume", "fresh"]
+          and sess == {"thread_id": "new1", "recovered": True},
+          f"rc={rc} calls={calls} sess={sess}")
+
+    # 7d fresh 失败两轮只生一个且进 4（P0-2）：fresh 失败但 thread 已出生 → 落指针；
+    # 下轮 resume 它（试住）turn 又失败 → exit=4；全程只 fresh 过一次
+    rc1, calls1, sess1, _ = run_l2(td7, [(0, set(), None),
+                                         (1, {"thread.started", "turn.failed"}, "new1")],
+                                   session_content={"thread_id": "old", "recovered": False})
+    ok1 = (rc1 == 3 and calls1 == ["resume", "fresh"]
+           and sess1["thread_id"] == "new1" and sess1["recovered"] is True
+           and sess1["recovery"]["attempts"] == 1
+           and sess1["recovery"]["old_tid"] == "old")
+    rc2, calls2, sess2, _ = run_l2(td7, [(1, {"thread.started", "turn.failed"}, "new1")],
+                                   session_content=sess1)
+    check("7d fresh失败两轮只生一个且进4",
+          ok1 and rc2 == 4 and calls2 == ["resume"] and sess2["thread_id"] == "new1",
+          f"rc1={rc1} calls1={calls1} sess1={sess1} | rc2={rc2} calls2={calls2}")
+
+    # 7e fresh 失败（thread 没出生）两轮 → 第二次进 4（P0-2 attempts 持久化；
+    # 第二轮 episode 进行中且指针还是死掉的旧家 → 跳过 resume 直接 fresh）
+    rc1, calls1, sess1, _ = run_l2(td7, [(0, set(), None), (1, set(), None)],
+                                   session_content={"thread_id": "old", "recovered": False})
+    ok1 = (rc1 == 3 and sess1["thread_id"] == "old"
+           and sess1["recovery"]["attempts"] == 1)
+    rc2, calls2, sess2, _ = run_l2(td7, [(1, set(), None)], session_content=sess1)
+    check("7e fresh 两次没出生 → 第二轮进4",
+          ok1 and rc2 == 4 and calls2 == ["fresh"]
+          and sess2["recovery"]["attempts"] == 2,
+          f"rc1={rc1} sess1={sess1} | rc2={rc2} calls2={calls2} sess2={sess2}")
+
+    # 7f recovered 指针 thread.started+turn.failed → 终止进 4（P0-2：旧版永远 exit=3）
+    rc, calls, sess, _ = run_l2(td7, [(0, {"thread.started", "turn.failed"}, "t")],
+                                session_content={"thread_id": "t", "recovered": True})
+    check("7f recovered turn_failed → 4",
+          rc == 4 and calls == ["resume"], f"rc={rc} calls={calls}")
+
+    # 7g recovered 指针 ghost → 4（原有 case③ 回归）
+    rc, calls, _, _ = run_l2(td7, [(0, set(), None)],
+                             session_content={"thread_id": "t", "recovered": True})
+    check("7g recovered ghost → 4", rc == 4 and calls == ["resume"], f"rc={rc}")
+
+    # 7h 试住成功一轮 → 洗回正常人家，episode 销账
+    rc, calls, sess, _ = run_l2(
+        td7, [(0, {"thread.started", "turn.completed"}, "t")],
+        session_content={"thread_id": "t", "recovered": True,
+                         "recovery": {"old_tid": "old", "attempts": 1}})
+    check("7h 试住成功洗回 false",
+          rc == 0 and sess == {"thread_id": "t", "recovered": False},
+          f"rc={rc} sess={sess}")
+
+    # 7i episode attempts 已用尽 → 不点火直接 4
+    rc, calls, _, _ = run_l2(td7, [], session_content={
+        "thread_id": "old", "recovered": True,
+        "recovery": {"old_tid": "old", "attempts": 2}})
+    check("7i attempts 用尽直接 4 不点火", rc == 4 and calls == [], f"rc={rc} calls={calls}")
+
+# --- 8. doorman l3_alert（太阳哥 #293 P1：POST 成功才记 6h 账 + 原子落盘） ---
+spec_dm = importlib.util.spec_from_file_location("doorman", BASE / "doorman.py")
+dm = importlib.util.module_from_spec(spec_dm)
+spec_dm.loader.exec_module(dm)
+
+with tempfile.TemporaryDirectory() as td8:
+    td8 = Path(td8)
+    dm.STATE_FILE = td8 / "state.json"
+    dm.LOG = td8 / "test.log"
+    cfg8 = {"server": "http://x"}
+    state8 = {"l3_alerted": {}}
+    calls8 = []
+
+    def post_fail(server, path, payload):
+        calls8.append(path)
+        raise OSError("网断了")
+
+    def post_ok(server, path, payload):
+        calls8.append(path)
+        return {"id": 1}
+
+    # 8a POST 失败：不记 6h 账、不落盘
+    dm.post_json = post_fail
+    dm.l3_alert(cfg8, state8, "太阳哥", "测试房")
+    check("8a POST失败不记账不落盘",
+          state8["l3_alerted"] == {} and not dm.STATE_FILE.exists()
+          and calls8 == ["/api/send"],
+          f"state={state8} calls={calls8}")
+
+    # 8b 失败后立即可重试（不静默六小时）；成功才记账 + 原子落盘
+    dm.post_json = post_ok
+    dm.l3_alert(cfg8, state8, "太阳哥", "测试房")
+    on_disk = _json.loads(dm.STATE_FILE.read_text(encoding="utf-8")) \
+        if dm.STATE_FILE.exists() else {}
+    check("8b 成功才记账且落盘",
+          len(calls8) == 2 and "太阳哥|测试房" in state8["l3_alerted"]
+          and "太阳哥|测试房" in on_disk.get("l3_alerted", {}),
+          f"calls={calls8} state={state8['l3_alerted']} disk={on_disk}")
+
+    # 8c 6h 幂等：成功记账后不再 POST
+    dm.l3_alert(cfg8, state8, "太阳哥", "测试房")
+    check("8c 6h 内不重复 POST", len(calls8) == 2, f"calls={calls8}")
 
 print()
 if fails:

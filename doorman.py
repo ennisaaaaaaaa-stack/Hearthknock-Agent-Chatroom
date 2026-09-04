@@ -2,6 +2,15 @@
 """
 门房 (doorman) v7 —— 客厅的门卫：有新消息就把对应 runtime 拉起来。
 
+v7.8（太阳哥 #293 一轮打回的门房侧整改，2026-09-05）：
+  - l3_alert 改为 POST 成功才记 6h 幂等账、记账后立刻原子落盘（旧版 POST 前
+    先写时间戳——发送失败也静默六小时；后台线程改 state 不落盘，门房恰好
+    死掉就失忆重敲）。exit=4 的覆盖面同期扩了（指针损坏/试住失败/fresh 用尽，
+    都在 wake-taiyang.py），报警文案不再只写「恢复后仍失败」
+  - state 落盘统一走 save_state（tmp+replace + 锁）：主循环和 wake 线程
+    （l3_alert）都会写，同一把锁
+  （wrapper 侧的 3 条 P0 和指针口径标注在 wake-taiyang.py / doorman.json）
+
 v7.7（zhaozhao模板轮审的三条整改，2026-09-03）：
   - 成员级叫醒模板覆盖：members.<name>.prompt_template 存在就用它，否则用全局
     prompt_template——hermes 的传输层（curl/上传/编码）wrapper 已包，叫醒词裁到五条款
@@ -87,7 +96,7 @@ v4/v5 沿用的规矩：
 户口: Chatroom-Autostart 计划任务每 5 分钟巡检，缺了会被重新拉起。
 """
 
-import json, subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request
+import json, os, subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -107,6 +116,16 @@ IN_FLIGHT = set()          # (member, room) 叫醒进程在飞——巡逻不重
 IN_FLIGHT_LOCK = threading.Lock()
 
 SUMMARY_PREFIX = "本房继承自"  # 门房代发的续房摘要，视同人类发言
+
+STATE_LOCK = threading.Lock()  # 主循环和 wake 线程（l3_alert）都会落 state，走同一把锁
+
+
+def save_state(state):
+    """tmp+replace 原子落：任何时刻文件要么是旧的整份要么是新的整份。"""
+    with STATE_LOCK:
+        tmp = STATE_FILE.with_name(STATE_FILE.name + ".tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+        os.replace(tmp, STATE_FILE)
 
 
 def load_cfg():
@@ -280,14 +299,44 @@ def build_prompt(cfg, member, room, msgs=None, closing=False, overflow=0):
     return prompt
 
 
+def l3_alert(cfg, state, member, room):
+    """exit=4 = 兜底链断到头（wrapper 侧：session 指针损坏 / 恢复后仍失败 /
+    fresh 试住失败或次数用尽——分类细节在 sessions/*.result.json，门房不解析）。
+    发房间消息 @tiexin——前端紫条高亮本来就认 @tiexin，不用再开机制。
+    同 member+room 6h 幂等（抄仵作 v3 的防尸体风暴）。
+    太阳哥 #293 P1 整改：POST 成功才记 6h 账、记账后立刻原子落盘——旧版 POST
+    前先写时间戳，发送失败也静默六小时；后台线程改 state 不落盘，门房恰好
+    死掉就失忆重敲。"""
+    key = f"{member}|{room}"
+    if time.time() - state.setdefault("l3_alerted", {}).get(key, 0) < 6 * 3600:
+        log(f"L3 报警 6h 内已敲过（{key}），不刷屏")
+        return
+    try:
+        post_json(cfg["server"], "/api/send", {
+            "room": room, "sender": "门房",
+            "text": f"[门房·L3] {member} 的兜底链断到头了（exit=4，分类见 "
+                    f"sessions/*.result.json），自动续命已停。@tiexin 需要人工看一眼。"})
+    except Exception as e:
+        log(f"L3 报警发送失败: {e}——不记 6h 账，下轮有机会再敲")
+        return
+    state["l3_alerted"][key] = time.time()
+    try:
+        save_state(state)
+    except Exception as e:
+        log(f"L3 报警记账落盘失败: {e}（最坏门房重启后重敲一遍，方向安全：多敲不少敲）")
+    log(f"L3 报警已发到「{room}」@tiexin（{member} exit=4）")
+
+
 def wake_once(cfg, member, room, msgs=None, closing=False, overflow=0):
-    """叫醒一次。返回 True = 归位（exit=0），主流程才敢 ack 落游标（at-least-once 的确认）。"""
+    """叫醒一次。返回被叫进程的 exit code；只有 0 主流程才敢 ack 落游标
+    （at-least-once 的确认）。4 = wrapper 的 L2 兜底链断到头（交 L3 报警）；
+    -1 超时 / -2 点火异常。"""
     spec = cfg["members"][member]
     prompt = build_prompt(cfg, member, room, msgs, closing, overflow)
     # prompt 同时落一份文件：WSL/跨机入口走 {prompt_file} 免引号转义
     pf = BASE / f".doorman-prompt-{member}.txt"
     pf.write_text(prompt, encoding="utf-8")
-    cmd = [s.format(prompt=prompt, prompt_file=str(pf)) for s in spec["cmd"]]
+    cmd = [s.format(prompt=prompt, prompt_file=str(pf), room=room) for s in spec["cmd"]]
     what = "关房摘要" if closing else f"{len(msgs)} 条"
     log(f"叫醒 {member}（房间「{room}」，{what}）")
     try:
@@ -304,31 +353,35 @@ def wake_once(cfg, member, room, msgs=None, closing=False, overflow=0):
             # stderr 非空就留账，不看 exit code：wrapper 兜底成功也是 exit=0，
             # 警告不能只在失败时可见（太阳哥链路复验 2026-09-01）
             log(f"{member} stderr 末尾: {p.stderr.strip()[-300:]}")
-        return p.returncode == 0
+        return p.returncode
     except subprocess.TimeoutExpired:
         log(f"{member} 超时未归（>{spec.get('timeout_sec', 900)}s）")
+        return -1
     except Exception as e:
         log(f"{member} 叫醒失败: {e}")
-    return False
+        return -2
 
 
-def wake(cfg, member, room, delivery_id, msgs=None, closing=False, overflow=0):
+def wake(cfg, member, room, delivery_id, msgs=None, closing=False, overflow=0, state=None):
     # 同一成员一次只跑一个进程。用户连续发消息时，新唤醒排队等上一轮结束，
     # 避免两个进程同时 resume 同一个会话。
     key = (member, room)
     try:
         lock = WAKE_LOCKS.setdefault(member, threading.Lock())
         with lock:
-            ok = wake_once(cfg, member, room, msgs, closing, overflow)
-        if ok and delivery_id:
+            rc = wake_once(cfg, member, room, msgs, closing, overflow)
+        if rc == 0 and delivery_id:
             # at-least-once 的 ack：归位才向台账确认投递单；确认前崩溃顶多重投，不会漏
             ack_cursor(cfg, room, member, delivery_id)
+        elif rc == 4 and state is not None:
+            l3_alert(cfg, state, member, room)
     finally:
         with IN_FLIGHT_LOCK:
             IN_FLIGHT.discard(key)
 
 
-def spawn_wake(member, room, upto=None, msgs=None, closing=False, overflow=0, cfg=None):
+def spawn_wake(member, room, upto=None, msgs=None, closing=False, overflow=0, cfg=None,
+               state=None):
     """点火前两道闸：一，同一 (member,room) 已有进程在飞就不重复点火——
     慢叫醒（冷启动约 1 分钟）期间巡逻照常转，新消息攒着，落地 ack 后下轮一起送；
     二，要落游标的叫醒先向hearth签发投递单（ack 只认签发过的单）——
@@ -348,7 +401,8 @@ def spawn_wake(member, room, upto=None, msgs=None, closing=False, overflow=0, cf
             return False
     threading.Thread(target=wake, kwargs={"cfg": cfg, "member": member, "room": room,
                                           "delivery_id": delivery_id, "msgs": msgs,
-                                          "closing": closing, "overflow": overflow},
+                                          "closing": closing, "overflow": overflow,
+                                          "state": state},
                      daemon=True, name=f"wake-{member}").start()
     return True
 
@@ -490,7 +544,7 @@ def patrol(cfg, agents, state, now):
             deliver, overflow = (mine[:cap], len(mine) - cap) if len(mine) > cap else (mine, 0)
             # 并行叫醒：一个成员慢（冷启动约 1 分钟）不挡别人的门铃
             spawn_wake(member, room, upto=deliver[-1]["id"], msgs=deliver,
-                       overflow=overflow, cfg=cfg)
+                       overflow=overflow, cfg=cfg, state=state)
     return dirty
 
 
@@ -520,14 +574,15 @@ def main():
         sys.exit(1)  # 闸不过：一行 state 不写、一下心跳不碰，原样退出
     # v7 起 state 只剩：节流记录（last_wake/wake_log）、关房通知去重、报警去重。
     # 游标在hearth台账（server 端 cursors 表）——这个文件整个丢了也不丢信。
-    state = {"last_wake": {}, "wake_log": {}, "closing_notified": [], "recovery_alerted": []}
+    state = {"last_wake": {}, "wake_log": {}, "closing_notified": [], "recovery_alerted": [],
+             "l3_alerted": {}}
     if STATE_FILE.exists():
         state.update(json.loads(STATE_FILE.read_text(encoding="utf-8")))
-    for k in ("last_wake", "wake_log", "closing_notified", "recovery_alerted"):
-        state.setdefault(k, {} if k in ("last_wake", "wake_log") else [])
+    for k in ("last_wake", "wake_log", "closing_notified", "recovery_alerted", "l3_alerted"):
+        state.setdefault(k, {} if k in ("last_wake", "wake_log", "l3_alerted") else [])
     state.pop("cursors", None)  # v6 遗存：游标已由 migrate_cursors_v7.py 迁进hearth台账，本地这份从此作废
 
-    log(f"门房 v7.7 上岗（游标台账在hearth，写游标 = prepare 签发投递单 + ack 确认单），房间动态从 server 拉取，每 {cfg['poll_seconds']}s 巡一次")
+    log(f"门房 v7.8 上岗（游标台账在hearth，写游标 = prepare 签发投递单 + ack 确认单），房间动态从 server 拉取，每 {cfg['poll_seconds']}s 巡一次")
     while True:
         now = time.time()
         # 心跳是看门人的命：进程活着但循环死了（僵尸）这件事已经发生过。
@@ -543,7 +598,7 @@ def main():
             dirty = True  # 至少把 state 落盘窗口保住
         if dirty:
             try:
-                STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+                save_state(state)
             except Exception as e:
                 log(f"state 落盘失败: {e}")
         time.sleep(cfg["poll_seconds"])

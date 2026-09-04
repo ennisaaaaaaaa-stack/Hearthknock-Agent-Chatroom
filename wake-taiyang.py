@@ -26,7 +26,31 @@
   超长 turn 不吃内存
 - 杀整棵进程树（太阳哥 #253 债②）：codex 挂进 KILL_ON_JOB_CLOSE 的 Job Object，
   wrapper 被门房 900s 超时杀掉时整棵树陪葬，不再留孤儿 codex.exe
+- L2 监督器（太阳哥 2026-09-03 #263 钉版，2026-09-04 落地；2026-09-05 #293
+  一轮打回的 3 P0 + 2 P1 整改）：--session-file 是门房模式总开关（没给=旧式
+  点火原样透传）。session 指针从 doorman.json 硬编码挪进 sessions/*.json，
+  wrapper 独占读写、tmp+replace 原子落。【如实标注（#293 P1）：指针是 agent 级
+  全局单指针——一个 agent 一个家，跨房共用同一 thread；恢复一个房 = 所有房
+  一起换家。agent×room 的 sticky 指针是后续项，没做之前别当它是。】
+  失败分类（exit 分层不变：0 成 / 2 prompt 文件 / 3 重投 / 4 L3）：
+  ① 有 thread.started 但 turn 失败 = thread 活着 → exit=3 重试同 session；
+     但 recovered=true 的指针同款失败 = 试住期间又失败 → exit=4
+  ② ghost 收窄（#293 P0-3）：只有「resume 且 rc=0 且零事件」才判 resume_lost
+     （三发实弹验过的签名）；rc≠0 零事件（认证/配置/启动错误同款长相）或
+     有事件无 thread.started → retry_same exit=3，不换身份
+  ③ resume_lost → 降级全新 exec（输入=工作区+原叫醒包，--room 告诉 wrapper
+     拉哪房），开 recovery episode 并持久化进指针文件：一次 episode 最多签
+     一个 fresh generation（fresh 失败但 thread 已出生也落指针，下轮 resume
+     它试住，不是再生一个），fresh 最多试 MAX_FRESH_ATTEMPTS 次；generation
+     失败或试住后再失败或次数用尽 → exit=4
+  ④ recovered 指针 ghost（恢复的新家从没活过一轮就没了）→ exit=4
+  ⑤ 指针文件已存在但损坏 → fail-closed exit=4（#293 P0-1：virgin=失忆老坑
+     在指针层的重演——缺文件可初始化，坏文件绝不擅自 fresh 换身份，留着验尸）
+  recovered 在新家成功跑过一轮后洗回 false——能正常生活的算正常人家。每轮
+  原子落 sessions/*.result.json：outcome/failure_class/thread_id/turn_terminal/rc，
+  给人和审计看；doorman 只认 exit code，不读 stderr、不解析 result。
 用法: python wake-taiyang.py exec resume --skip-git-repo-check <session-id> --prompt-file <prompt-file>
+门房 L2 用法: python wake-taiyang.py exec --skip-git-repo-check --session-file <json> --room <房名> --prompt-file <prompt-file>
 """
 
 import json
@@ -34,7 +58,10 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import tomllib
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 CODEX_HOME = Path.home() / ".codex"
@@ -210,22 +237,135 @@ def assign_kill_on_close_job(proc):
         return None
 
 
-def main():
-    args, prompt = split_prompt_file(sys.argv[1:])
-    codex = resolve_codex()
-    if not codex:
-        print("[wake-taiyang] 找不到任何 codex.exe", file=sys.stderr)
-        return 127
-    # exec 才有一轮 turn 可验；--version 等别的用法原样透传
-    if "exec" not in args:
-        p = subprocess.run([str(codex)] + args,
-                           input=prompt.encode("utf-8") if prompt is not None else None)
-        return p.returncode
-    if "--json" not in args:
-        args = args + ["--json"]
-    # 流式收集（太阳哥 2026-09-02 #253 债①）：以前 subprocess.run 整包双重缓冲，
-    # 超长 turn 把全部 JSONL 压在内存里；现在逐行读，边收边原样吐回（门房日志
-    # 链路不变），事件终态逐行判。stderr 让 child 直接继承。
+# ── L2 监督器（太阳哥 2026-09-03 #263 钉版：不要失败即 fork，按失败分类；
+#    2026-09-05 #293 整改：ghost 签名收窄 + recovery episode 持久化 + 坏指针 fail-closed）──
+# ① 有 thread.started 但 turn 失败 = thread 活着 → exit=3，指针不动，下轮重试同 session
+#    （recovered=true 的除外：试住期间又失败 = 兜底链断到头 → exit=4）
+# ② ghost 签名收窄：resume 且 rc=0 且零事件才判 resume_lost → 降级全新 exec；
+#    rc≠0 零事件 / 有事件无 thread.started → retry_same exit=3，不换身份
+# ③ recovery episode 持久化在指针文件里：一次 episode 最多签一个 fresh generation、
+#    fresh 最多试 MAX_FRESH_ATTEMPTS 次；generation 失败 / 试住后再失败 / 次数用尽
+#    → exit=4 交 L3 不再生崽。recovered 在新家成功跑过一轮后洗回 false
+# ④ 指针文件损坏 = fail-closed exit=4（缺文件才可当初次上岗）
+
+SERVER = "http://localhost:7788"  # 拉工作区用；太阳哥和门房同机
+
+MAX_FRESH_ATTEMPTS = 2  # 一次 recovery episode 里 fresh 的最大尝试次数（太阳哥 #293 P0-2：
+                        # 不持久化尝试数，fresh 失败下轮失忆重来，能无限生新 thread）
+
+
+def split_wrapper_flags(args):
+    """摘掉 wrapper 自己的 flag（--session-file/--room），剩下的透传给 codex。
+    --session-file 是 L2 门房模式的总开关：没给就是旧式点火，参数原样透传。"""
+    session_file = room = None
+    out = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--session-file" and i + 1 < len(args):
+            session_file = args[i + 1]
+            i += 2
+        elif args[i] == "--room" and i + 1 < len(args):
+            room = args[i + 1]
+            i += 2
+        else:
+            out.append(args[i])
+            i += 1
+    return out, session_file, room
+
+
+def atomic_write_json(path, obj):
+    """tmp+replace 原子落：任何时刻文件要么是旧的整份要么是新的整份。"""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=1), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def load_session(path):
+    """读 agent 级全局指针（如实标注：不是 agent×room，见文件头 L2 段）。
+    返回 (thread_id, recovered, recovery, corrupt)。
+    文件不存在 = 初次上岗（可初始化）；已存在但损坏 = fail-closed（corrupt=True）
+    ——绝不当初次上岗擅自 fresh 换身份（太阳哥 #293 P0-1：virgin=失忆老坑在
+    指针层的重演。坏文件一行不写，留着验尸）。"""
+    try:
+        d = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None, False, None, False
+    except Exception as e:
+        print(f"[wake-taiyang] session 文件损坏 {path}: {e}——fail-closed 交 L3，"
+              f"不擅自换身份（坏文件留着验尸）", file=sys.stderr)
+        return None, False, None, True
+    if not isinstance(d, dict):
+        print(f"[wake-taiyang] session 文件不是 JSON 对象 {path}——fail-closed 交 L3",
+              file=sys.stderr)
+        return None, False, None, True
+    return d.get("thread_id"), bool(d.get("recovered")), d.get("recovery"), False
+
+
+def write_result(session_file, **kw):
+    """每轮原子落一份 result JSON 在指针旁边：outcome/failure_class/thread_id/
+    turn_terminal/rc——给人和审计看的。doorman 只认 exit code，不解析这个文件。"""
+    if not session_file:
+        return
+    kw.setdefault("ts", time.strftime("%Y-%m-%d %H:%M:%S"))
+    try:
+        atomic_write_json(str(session_file) + ".result.json", kw)
+    except Exception as e:
+        print(f"[wake-taiyang] result JSON 落盘失败: {e}（不挡主链）", file=sys.stderr)
+
+
+def fetch_workspace(room):
+    """全新 exec 的上下文补救：拉房间工作区（决定/待办/进度）。拉不到不挡点火。"""
+    try:
+        q = urllib.parse.urlencode({"room": room})
+        with urllib.request.urlopen(f"{SERVER}/api/workspace?{q}", timeout=10) as r:
+            return json.loads(r.read().decode("utf-8")).get("content") or ""
+    except Exception as e:
+        print(f"[wake-taiyang] 拉工作区失败（{room}）: {e}——不挡点火", file=sys.stderr)
+        return ""
+
+
+def build_resume_args(args, tid):
+    """exec --flags [-] → exec resume --flags <tid> [-]：session_id 必须插在 prompt
+    位置参数（"-"）之前——clap 按位置顺序认 [SESSION_ID] [PROMPT]，颠倒会张冠李戴。
+    不能假设 "-" 在末尾：--json 是 split_prompt_file 之后才追加进 args 的。"""
+    i = args.index("exec")
+    head, rest = args[:i + 1], args[i + 1:]
+    if "-" in rest:
+        j = rest.index("-")
+        return head + ["resume"] + rest[:j] + [tid] + rest[j:]
+    return head + ["resume"] + rest + [tid]
+
+
+def build_fresh_prompt(room, prompt, old_tid):
+    """全新 exec 的输入：恢复说明 + 工作区 + 原叫醒包（叫醒包自带最近 N 条）。"""
+    if prompt is None:
+        return None
+    parts = ["[门房·L2 恢复] 你的旧 session 没能续上（resume 找不到 rollout），"
+             "这是一次全新点火。旧 thread_id=%s。上下文补救如下，读完接着干活。\n"
+             % (old_tid or "无")]
+    if room:
+        ws = fetch_workspace(room)
+        if ws:
+            parts.append("## 房间「%s」工作区（决定/待办/进度）\n%s\n" % (room, ws))
+    parts.append("## 原叫醒包\n" + prompt)
+    return "\n".join(parts)
+
+
+def turn_terminal(types):
+    return "failed" if "turn.failed" in types else (
+        "completed" if "turn.completed" in types else "none")
+
+
+def turn_ok(rc, types):
+    """不信 exit code：exit=0 且本轮出现 turn.completed 且无 turn.failed 才算醒。"""
+    return rc == 0 and "turn.completed" in types and "turn.failed" not in types
+
+
+def run_exec(codex, args, prompt):
+    """点一次 codex exec：流式收 stdout 逐行边吐边判终态，挂杀树 job。
+    返回 (rc, types set, thread_id or None)。"""
     p = subprocess.Popen([str(codex)] + args,
                          stdin=subprocess.PIPE if prompt is not None else None,
                          stdout=subprocess.PIPE)
@@ -240,9 +380,7 @@ def main():
                 pass  # 孩子早夭，饭倒了，rc 会告诉我们
         threading.Thread(target=_feed, daemon=True).start()
     # TODO(非阻断，太阳哥 2026-09-03 37610a8 轮审)：Popen 后再 assign 有极短
-    # 抢跑窗口——child 若在 assign 前抢先 fork 出子进程，早产孙辈漏在 job 外，
-    # 杀树时漏网。codex 实测真抢跑了再升级 CREATE_SUSPENDED → assign →
-    # ResumeThread（创建即挂起，挂进 job 后再放行）。
+    # 抢跑窗口——child 若在 assign 前抢先 fork 出子进程，早产孙辈漏在 job 外。
     assign_kill_on_close_job(p)
     types = set()
     thread_id = None
@@ -254,15 +392,139 @@ def main():
             types.add(t)
         if tid:
             thread_id = tid
-    rc = p.wait()
-    if thread_id:
-        print(f"[wake-taiyang] thread_id={thread_id}", file=sys.stderr)
-    if rc == 0 and "turn.completed" in types and "turn.failed" not in types:
+    return p.wait(), types, thread_id
+
+
+def main():
+    args, prompt = split_prompt_file(sys.argv[1:])
+    args, session_file, room = split_wrapper_flags(args)
+    codex = resolve_codex()
+    if not codex:
+        print("[wake-taiyang] 找不到任何 codex.exe", file=sys.stderr)
+        return 127
+    # exec 才有一轮 turn 可验；--version 等别的用法原样透传
+    if "exec" not in args:
+        p = subprocess.run([str(codex)] + args,
+                           input=prompt.encode("utf-8") if prompt is not None else None)
+        return p.returncode
+    if "--json" not in args:
+        args = args + ["--json"]
+    if not session_file:
+        # 旧式点火（resume <id> 由调用方自己拼进 args）：原样透传
+        rc, types, thread_id = run_exec(codex, args, prompt)
+        if thread_id:
+            print(f"[wake-taiyang] thread_id={thread_id}", file=sys.stderr)
+        if turn_ok(rc, types):
+            return 0
+        # 不信 exit code：turn.failed 或无 completed 一律 exit=3（不 ack，等重投）。
+        # 原始非零 rc 记进 stderr 留账，对外只认 3——门房侧「非零即失败」语义不变
+        print(f"[wake-taiyang] 本轮没有 turn.completed（rc={rc}, "
+              f"events={sorted(types) or '无'}），按失败 exit=3", file=sys.stderr)
+        return 3
+    # ── L2 门房模式：session 指针 wrapper 自己持有，按失败分类处置 ──
+    tid, recovered, recovery, corrupt = load_session(session_file)
+    if corrupt:
+        # 坏指针 fail-closed：不点火、不写指针文件，只落 result 交 L3（#293 P0-1）
+        write_result(session_file, outcome="l3", failure_class="session_corrupt",
+                     thread_id=None, turn_terminal="none", rc=None)
+        return 4
+    # recovery episode 进行中且指针还指着死掉的旧家（或没签到家）→ 跳过 resume
+    # 直接续 fresh；指针已是新一代（tid != old_tid）才走 resume（试住验收）
+    if tid and not (recovery and tid == recovery.get("old_tid")):
+        rc, types, _ = run_exec(codex, build_resume_args(args, tid), prompt)
+        if "thread.started" in types:
+            # thread 活着，成败只看 turn 终态
+            if turn_ok(rc, types):
+                if recovered or recovery:
+                    # 恢复的新家成功生活了一轮 → 洗回正常人家，episode 销账
+                    atomic_write_json(session_file, {"thread_id": tid, "recovered": False})
+                write_result(session_file, outcome="ok", failure_class="none",
+                             thread_id=tid, turn_terminal="completed", rc=rc)
+                return 0
+            if recovered:
+                # 试住期间 turn 又失败 → 兜底链断到头（#293 P0-2：旧版这里
+                # exit=3 重试同 session，recovered 指针能永远重试下去）
+                write_result(session_file, outcome="l3",
+                             failure_class="recovered_turn_failed",
+                             thread_id=tid, turn_terminal=turn_terminal(types), rc=rc,
+                             events=sorted(types))
+                print(f"[wake-taiyang] 恢复出的 thread {tid} 试住期间 turn 又失败"
+                      f"（rc={rc}, events={sorted(types) or '无'}）——"
+                      f"兜底链断到头，exit=4 交 L3", file=sys.stderr)
+                return 4
+            write_result(session_file, outcome="retry_same", failure_class="turn_failed",
+                         thread_id=tid, turn_terminal=turn_terminal(types), rc=rc,
+                         events=sorted(types))
+            print(f"[wake-taiyang] thread 活着但本轮没有 turn.completed（rc={rc}, "
+                  f"events={sorted(types) or '无'}）——指针不动，exit=3 重试同 session",
+                  file=sys.stderr)
+            return 3
+        # 无 thread.started：先按签名分类，不是 ghost 就不换身份（#293 P0-3 收窄：
+        # 只有「resume 且 rc=0 且零事件」是三发实弹验过的 ghost；rc≠0 零事件是
+        # 认证/配置/启动错误的同款长相，有事件无 thread.started 也不是没接上）
+        if not (rc == 0 and not types):
+            write_result(session_file, outcome="retry_same", failure_class="resume_error",
+                         thread_id=tid, turn_terminal=turn_terminal(types), rc=rc,
+                         events=sorted(types))
+            print(f"[wake-taiyang] resume 异常但不是 ghost 签名（rc={rc}, "
+                  f"events={sorted(types) or '无'}）——指针不动，exit=3 重试同 session",
+                  file=sys.stderr)
+            return 3
+        # ghost = resume_lost
+        if recovered:
+            # 恢复的新家从没活过一轮就又没了 → 交 L3，不再生崽
+            write_result(session_file, outcome="l3", failure_class="recovered_lost",
+                         thread_id=tid, turn_terminal="none", rc=rc, events=[])
+            print(f"[wake-taiyang] 恢复出的 thread {tid} resume 又失败——"
+                  f"兜底链断到头，exit=4 交 L3，不再自动生崽", file=sys.stderr)
+            return 4
+        print(f"[wake-taiyang] resume 没接上（thread {tid} 找不到 rollout，ghost 签名）"
+              f"——降级全新 exec，开 recovery episode", file=sys.stderr)
+        recovery = {"old_tid": tid, "attempts": 0,
+                    "started_ts": time.strftime("%Y-%m-%d %H:%M:%S")}
+    # ── fresh 路径（初次上岗 / ghost 降级 / episode 续试）──
+    old_tid = recovery.get("old_tid") if recovery else None
+    attempts = int(recovery.get("attempts", 0)) if recovery else 0
+    if attempts >= MAX_FRESH_ATTEMPTS:
+        write_result(session_file, outcome="l3", failure_class="fresh_exhausted",
+                     thread_id=tid or old_tid, turn_terminal="none", rc=None)
+        print(f"[wake-taiyang] recovery episode 已试 {attempts} 次 fresh 全失败——"
+              f"兜底链断到头，exit=4 交 L3，不再自动生崽", file=sys.stderr)
+        return 4
+    rc, types, new_tid = run_exec(codex, args, build_fresh_prompt(room, prompt, old_tid or tid))
+    attempts += 1
+    if turn_ok(rc, types) and new_tid:
+        # 原子写指针，episode 销账；从旧家搬来的打 recovered=true（试住期）
+        atomic_write_json(session_file,
+                          {"thread_id": new_tid, "recovered": recovery is not None})
+        write_result(session_file, outcome="fresh_recovered" if recovery else "ok",
+                     failure_class="resume_lost" if recovery else "none",
+                     thread_id=new_tid, turn_terminal="completed", rc=rc)
+        print(f"[wake-taiyang] 全新 exec 归位，新指针 {new_tid}"
+              f"（recovered={recovery is not None}）", file=sys.stderr)
         return 0
-    # 不信 exit code：turn.failed 或无 completed 一律 exit=3（不 ack，等重投）。
-    # 原始非零 rc 记进 stderr 留账，对外只认 3——门房侧「非零即失败」语义不变
-    print(f"[wake-taiyang] 本轮没有 turn.completed（rc={rc}, "
-          f"events={sorted(types) or '无'}），按失败 exit=3", file=sys.stderr)
+    # fresh 失败：episode 和 attempts 必须落盘，否则下轮失忆重数（无限生崽的洞，
+    # #293 P0-2）。thread 已出生（new_tid）也一样落指针——一次 episode 只签一个
+    # generation，下轮 resume 它试住，不是再生一个
+    keep = new_tid or old_tid or tid
+    atomic_write_json(session_file, {
+        "thread_id": keep, "recovered": True,
+        "recovery": {"old_tid": old_tid or tid, "attempts": attempts,
+                     "started_ts": (recovery or {}).get("started_ts")
+                                   or time.strftime("%Y-%m-%d %H:%M:%S")}})
+    if attempts >= MAX_FRESH_ATTEMPTS:
+        write_result(session_file, outcome="l3", failure_class="fresh_exhausted",
+                     thread_id=keep, turn_terminal=turn_terminal(types), rc=rc,
+                     events=sorted(types))
+        print(f"[wake-taiyang] 第 {attempts} 次 fresh 也没拿到 turn.completed——"
+              f"episode 尝试用尽，exit=4 交 L3", file=sys.stderr)
+        return 4
+    write_result(session_file, outcome="retry_fresh", failure_class="fresh_failed",
+                 thread_id=keep, turn_terminal=turn_terminal(types), rc=rc,
+                 events=sorted(types))
+    print(f"[wake-taiyang] 第 {attempts} 次 fresh 没拿到 turn.completed（rc={rc}, "
+          f"events={sorted(types) or '无'}）——episode 已落盘（attempts={attempts}），"
+          f"exit=3 等重投", file=sys.stderr)
     return 3
 
 
