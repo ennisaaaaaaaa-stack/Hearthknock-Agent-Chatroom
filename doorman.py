@@ -2,6 +2,11 @@
 """
 门房 (doorman) v7 —— 客厅的门卫：有新消息就把对应 runtime 拉起来。
 
+v7.9（太阳哥 #299 二轮的 P1 整改，2026-09-05）：
+  - 关房分支 spawn_wake 补传 state：旧版漏传，admin 若是 wrapper 成员（太阳哥）
+    且 exit=4，wake() 里 state is None，l3_alert 静默哑火——关房摘要的兜底链
+    断到头了也没人知道
+
 v7.8（太阳哥 #293 一轮打回的门房侧整改，2026-09-05）：
   - l3_alert 改为 POST 成功才记 6h 幂等账、记账后立刻原子落盘（旧版 POST 前
     先写时间戳——发送失败也静默六小时；后台线程改 state 不落盘，门房恰好
@@ -440,7 +445,7 @@ def patrol(cfg, agents, state, now):
                 state["closing_notified"].append(room)
                 dirty = True
                 log(f"「{room}」进入关闭流程，通知管理员 {admin}")
-                spawn_wake(admin, room, closing=True, cfg=cfg)
+                spawn_wake(admin, room, closing=True, cfg=cfg, state=state)
             else:
                 state["closing_notified"].append(room)
                 dirty = True
@@ -582,7 +587,7 @@ def main():
         state.setdefault(k, {} if k in ("last_wake", "wake_log", "l3_alerted") else [])
     state.pop("cursors", None)  # v6 遗存：游标已由 migrate_cursors_v7.py 迁进hearth台账，本地这份从此作废
 
-    log(f"门房 v7.8 上岗（游标台账在hearth，写游标 = prepare 签发投递单 + ack 确认单），房间动态从 server 拉取，每 {cfg['poll_seconds']}s 巡一次")
+    log(f"门房 v7.9 上岗（游标台账在hearth，写游标 = prepare 签发投递单 + ack 确认单），房间动态从 server 拉取，每 {cfg['poll_seconds']}s 巡一次")
     while True:
         now = time.time()
         # 心跳是看门人的命：进程活着但循环死了（僵尸）这件事已经发生过。

@@ -14,9 +14,14 @@
    CloseHandle 触发 KILL_ON_JOB_CLOSE，父子两 PID 都必须死；非 Windows 放行
 7. L2 状态机（太阳哥 2026-09-05 #293 打回后点名的测试清单）：坏指针不 fresh、
    fresh 失败两轮只生一个且进 4、recovered turn_failed 能终止、rc1 无事件
-   不换指针、ghost 真签名保留、episode attempts 持久化与用尽、试住成功洗回
+   不换指针、ghost 真签名保留、episode attempts 持久化与用尽、试住成功洗回；
+   #299 P0 schema 校验反例：{} / thread_id:null / recovery 非 dict /
+   attempts 越界或假 int / recovered 假 bool 全部 session_corrupt→4 不点火、
+   原文件不动；上岗中间态（thread_id:null + episode 进行中）是合法自己人不误杀
 8. doorman l3_alert（#293 P1）：POST 失败不记 6h 账不落盘、可立即重试；
    成功才记账并原子落盘；6h 幂等不刷屏
+9. doorman 关房分支 wake 路由（#299 P1）：spawn_wake 必须带上 state，
+   admin 是 wrapper 成员时 exit=4 才路由得进 l3_alert（state=None 哑火）
 
 跑法：python test_wake_taiyang.py
 """
@@ -414,6 +419,57 @@ with tempfile.TemporaryDirectory() as td7:
         "recovery": {"old_tid": "old", "attempts": 2}})
     check("7i attempts 用尽直接 4 不点火", rc == 4 and calls == [], f"rc={rc} calls={calls}")
 
+    # ── #299 P0 schema 校验反例（validate_session_state）──
+    # 7j 反例①：{} 以前被当初次上岗直接 fresh 换身份 → 现在 session_corrupt
+    rc, calls, _, raw = run_l2(td7, [], session_content="{}")
+    res = _json.loads((td7 / "sess.json.result.json").read_text(encoding="utf-8"))
+    check("7j 空对象 {} → 4 不点火不换身份",
+          rc == 4 and calls == [] and raw == "{}"
+          and res.get("failure_class") == "session_corrupt",
+          f"rc={rc} calls={calls} raw={raw!r} res={res}")
+
+    # 7k 反例②：thread_id:null 且没有 episode → session_corrupt，原文件不动
+    rc, calls, _, raw = run_l2(td7, [], session_content={"thread_id": None, "recovered": False})
+    check("7k thread_id:null → 4 原文件不动",
+          rc == 4 and calls == []
+          and _json.loads(raw) == {"thread_id": None, "recovered": False},
+          f"rc={rc} calls={calls} raw={raw!r}")
+
+    # 7l 反例③：recovery:"坏" 以前在 recovery.get 崩成 exit=1 交不到 L3 → 现在 4
+    rc, calls, _, raw = run_l2(td7, [], session_content={
+        "thread_id": "t", "recovered": False, "recovery": "坏"})
+    res = _json.loads((td7 / "sess.json.result.json").read_text(encoding="utf-8"))
+    check("7l recovery 非 dict → 4（不崩 exit=1）",
+          rc == 4 and calls == [] and res.get("failure_class") == "session_corrupt"
+          and _json.loads(raw)["recovery"] == "坏",
+          f"rc={rc} calls={calls}")
+
+    # 7m 反例④：attempts -1 / bool / 超界 / 浮点 / 字符串 → 绕不过尝试预算，全 corrupt
+    for bad in (-1, True, wt.MAX_FRESH_ATTEMPTS + 1, 1.5, "1"):
+        rc, calls, _, _ = run_l2(td7, [], session_content={
+            "thread_id": "old", "recovered": True,
+            "recovery": {"old_tid": "old", "attempts": bad}})
+        check(f"7m attempts={bad!r} → 4 不点火", rc == 4 and calls == [],
+              f"rc={rc} calls={calls}")
+
+    # 7n recovered 假 bool（1/"yes"）→ corrupt；recovered 必须真 bool
+    for bad in (1, "yes"):
+        rc, calls, _, _ = run_l2(td7, [], session_content={
+            "thread_id": "t", "recovered": bad})
+        check(f"7n recovered={bad!r} → 4", rc == 4 and calls == [], f"rc={rc}")
+
+    # 7o 正向控制：初次上岗 fresh 失败写出的中间态（thread_id:null + episode 进行中）
+    # 是 wrapper 自己人，validator 不许误杀——第二轮该续 fresh 归位，不是判 corrupt
+    rc, calls, sess, _ = run_l2(
+        td7, [(0, {"thread.started", "turn.completed"}, "new1")],
+        session_content={"thread_id": None, "recovered": True,
+                         "recovery": {"old_tid": None, "attempts": 1,
+                                      "started_ts": "2026-09-05 00:00:00"}})
+    check("7o 上岗中间态（null+episode）合法续 fresh",
+          rc == 0 and calls == ["fresh"]
+          and sess == {"thread_id": "new1", "recovered": True},
+          f"rc={rc} calls={calls} sess={sess}")
+
 # --- 8. doorman l3_alert（太阳哥 #293 P1：POST 成功才记 6h 账 + 原子落盘） ---
 spec_dm = importlib.util.spec_from_file_location("doorman", BASE / "doorman.py")
 dm = importlib.util.module_from_spec(spec_dm)
@@ -456,6 +512,43 @@ with tempfile.TemporaryDirectory() as td8:
     # 8c 6h 幂等：成功记账后不再 POST
     dm.l3_alert(cfg8, state8, "太阳哥", "测试房")
     check("8c 6h 内不重复 POST", len(calls8) == 2, f"calls={calls8}")
+
+# --- 9. doorman 关房分支 wake 路由（#299 P1）：spawn_wake 必须带上 state，
+#        否则 admin 是 wrapper 成员时 exit=4 到不了 l3_alert（L3 静默哑火） ---
+with tempfile.TemporaryDirectory() as td9:
+    td9 = Path(td9)
+    dm.STATE_FILE = td9 / "state.json"
+    dm.LOG = td9 / "test.log"
+    cfg9 = {"server": "http://x", "members": {"太阳哥": {"cmd": ["x"]}}}
+    state9 = {"closing_notified": [], "l3_alerted": {}}
+
+    # 9a 巡逻撞到 closing 房：spawn_wake 拿到的 kwargs 里必须有 state（且 closing=True）
+    captured = {}
+    old_spawn, old_rooms = dm.spawn_wake, dm.fetch_rooms
+    dm.spawn_wake = lambda *a, **kw: captured.update(kw=kw) or True
+    dm.fetch_rooms = lambda server: [{"room": "旧房", "members": [],
+                                      "state": "closing", "admin": "太阳哥"}]
+    try:
+        dm.patrol(cfg9, set(), state9, 0)
+    finally:
+        dm.spawn_wake, dm.fetch_rooms = old_spawn, old_rooms
+    check("9a 关房分支 spawn_wake 带上 state",
+          captured.get("kw", {}).get("state") is state9
+          and captured["kw"].get("closing") is True,
+          f"kw={captured.get('kw')}")
+
+    # 9b 路由验收：exit=4 + state 在场 → l3_alert 必响；state=None 哑火（正是这次 P1 的洞）
+    hits = []
+    old_wake_once, old_l3 = dm.wake_once, dm.l3_alert
+    dm.wake_once = lambda *a, **k: 4
+    dm.l3_alert = lambda cfg, state, member, room: hits.append((member, room))
+    try:
+        dm.wake(cfg9, "太阳哥", "旧房", None, closing=True, state=state9)
+        dm.wake(cfg9, "太阳哥", "旧房", None, closing=True)  # state=None：不许响
+    finally:
+        dm.wake_once, dm.l3_alert = old_wake_once, old_l3
+    check("9b exit=4 有 state 才路由进 l3_alert", hits == [("太阳哥", "旧房")],
+          f"hits={hits}")
 
 print()
 if fails:
