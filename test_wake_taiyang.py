@@ -481,29 +481,37 @@ with tempfile.TemporaryDirectory() as td7:
     rc, calls, _, raw = run_l2(td7, [], session_content=counter)
     res = _json.loads((td7 / "sess.json.result.json").read_text(encoding="utf-8"))
     check("7p #303 最小反例 → 4 不点火原文件不动",
-          rc == 4 and calls == [] and _json.loads(raw) == counter
+          rc == 4 and calls == []
+          and raw == _json.dumps(counter, ensure_ascii=False)  # 逐字节，不止解析相等
           and res.get("failure_class") == "session_corrupt",
           f"rc={rc} calls={calls} raw={raw!r} res={res}")
 
     # 7q 钉①单变量：recovered=false + 合法 episode（attempts=1）→ 组合自相矛盾
-    rc, calls, _, _ = run_l2(td7, [], session_content={
-        "thread_id": "old", "recovered": False,
-        "recovery": {"old_tid": "old", "attempts": 1}})
-    check("7q recovered=false+recovery → 4 不点火", rc == 4 and calls == [],
-          f"rc={rc} calls={calls}")
+    case_q = {"thread_id": "old", "recovered": False,
+              "recovery": {"old_tid": "old", "attempts": 1}}
+    rc, calls, _, raw = run_l2(td7, [], session_content=case_q)
+    check("7q recovered=false+recovery → 4 不点火原文件不动",
+          rc == 4 and calls == []
+          and raw == _json.dumps(case_q, ensure_ascii=False),
+          f"rc={rc} calls={calls} raw={raw!r}")
 
     # 7r 钉②单变量：attempts=0（episode 落盘时一定已试过一次，0 是假账）→ 4
-    rc, calls, _, _ = run_l2(td7, [], session_content={
-        "thread_id": "old", "recovered": True,
-        "recovery": {"old_tid": "old", "attempts": 0}})
-    check("7r attempts=0 → 4 不点火", rc == 4 and calls == [], f"rc={rc} calls={calls}")
+    case_r = {"thread_id": "old", "recovered": True,
+              "recovery": {"old_tid": "old", "attempts": 0}}
+    rc, calls, _, raw = run_l2(td7, [], session_content=case_r)
+    check("7r attempts=0 → 4 不点火原文件不动",
+          rc == 4 and calls == []
+          and raw == _json.dumps(case_r, ensure_ascii=False),
+          f"rc={rc} calls={calls} raw={raw!r}")
 
     # 7s 钉③单变量：thread_id=null 但 old_tid 非 null（没签到家却有旧家）→ 4
-    rc, calls, _, _ = run_l2(td7, [], session_content={
-        "thread_id": None, "recovered": True,
-        "recovery": {"old_tid": "old", "attempts": 1}})
-    check("7s null 指针+非空 old_tid → 4 不点火", rc == 4 and calls == [],
-          f"rc={rc} calls={calls}")
+    case_s = {"thread_id": None, "recovered": True,
+              "recovery": {"old_tid": "old", "attempts": 1}}
+    rc, calls, _, raw = run_l2(td7, [], session_content=case_s)
+    check("7s null 指针+非空 old_tid → 4 不点火原文件不动",
+          rc == 4 and calls == []
+          and raw == _json.dumps(case_s, ensure_ascii=False),
+          f"rc={rc} calls={calls} raw={raw!r}")
 
 # --- 8. doorman l3_alert（太阳哥 #293 P1：POST 成功才记 6h 账 + 原子落盘） ---
 spec_dm = importlib.util.spec_from_file_location("doorman", BASE / "doorman.py")
