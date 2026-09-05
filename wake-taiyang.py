@@ -46,11 +46,14 @@
   ④ recovered 指针 ghost（恢复的新家从没活过一轮就没了）→ exit=4
   ⑤ 指针文件已存在但损坏 → fail-closed exit=4（#293 P0-1：virgin=失忆老坑
      在指针层的重演——缺文件可初始化，坏文件绝不擅自 fresh 换身份，留着验尸）
-  ⑥ 状态 schema 校验（太阳哥 #299 P0）：能解析且是 dict 还不够——thread_id
-     必须非空 str、recovered 必须真 bool、recovery 只能 null/dict、attempts
-     必须真 int 且 0..MAX；字段组合不合即 session_corrupt→4，原文件一行不写。
+  ⑥ 状态 schema 校验（太阳哥 #299 P0 + #303 P0 组合洞）：能解析且是 dict 还不够——
+     thread_id 必须非空 str、recovered 必须真 bool、recovery 只能 null/dict、attempts
+     必须真 int 且 1..MAX（落盘时一定已试过一次，0 不合法）、recovery 在场必须
+     recovered=true、thread_id=null 时 old_tid 必须 null；字段组合不合即
+     session_corrupt→4，原文件一行不写。
      （{} / thread_id:null 不再被当初次上岗 fresh 换身份；recovery:"坏" 不再
-     崩 exit=1 交不到 L3；attempts:-1/bool/超界 绕不过尝试预算）
+     崩 exit=1 交不到 L3；attempts:-1/bool/超界 绕不过尝试预算；
+     recovered=false+recovery 的伪健康指针不再跳过 resume 静默换身份）
   recovered 在新家成功跑过一轮后洗回 false——能正常生活的算正常人家。每轮
   原子落 sessions/*.result.json：outcome/failure_class/thread_id/turn_terminal/rc，
   给人和审计看；doorman 只认 exit code，不读 stderr、不解析 result。
@@ -252,8 +255,10 @@ def assign_kill_on_close_job(proc):
 #    fresh 最多试 MAX_FRESH_ATTEMPTS 次；generation 失败 / 试住后再失败 / 次数用尽
 #    → exit=4 交 L3 不再生崽。recovered 在新家成功跑过一轮后洗回 false
 # ④ 指针文件损坏 = fail-closed exit=4（缺文件才可当初次上岗）
-# ⑤ schema 校验（#299 P0）：字段类型/组合不变量不合 = session_corrupt exit=4，
-#    原文件不写——{} / thread_id:null / recovery:"坏" / attempts 越界都不是初次上岗
+# ⑤ schema 校验（#299 P0 + #303 P0 组合洞）：字段类型/组合不变量不合 =
+#    session_corrupt exit=4，原文件不写——{} / thread_id:null / recovery:"坏" /
+#    attempts 越界都不是初次上岗；recovery 在场必须 recovered=true 且 attempts≥1、
+#    thread_id=null 必须 old_tid=null，伪健康指针不许跳过 resume 静默换身份
 
 SERVER = "http://localhost:7788"  # 拉工作区用；太阳哥和门房同机
 
@@ -297,7 +302,14 @@ def validate_session_state(d):
     坏文件一行不写，留着验尸）。
     组合不变量：thread_id 缺席/null 只在 recovery episode 进行中（recovery 是合法
     dict）才合法——初次上岗 fresh 失败会写出这种中间态；没有 episode 的「无名指针」
-    一律是坏文件，不是初次上岗。"""
+    一律是坏文件，不是初次上岗。
+    组合钉三条（太阳哥 #303 P0：「recovery 在场但 recovered=false」以前合法，
+    最小反例 {"thread_id":"old","recovered":false,"recovery":{"old_tid":"old",
+    "attempts":0}} 会跳过 resume 直接 fresh，静默换掉本来健康的指针）：
+    ① recovery != null => recovered 必须 true（落盘路径里 episode 一定配 true）
+    ② attempts 范围 1..MAX——recovery 落盘时一定已经试过一次 fresh（写盘前
+       attempts += 1），磁盘上不存在 attempts=0 的 episode
+    ③ thread_id=null 时 old_tid 也必须 null（没签到家就没有旧家可言）"""
     if type(d.get("recovered")) is not bool:
         return "recovered 缺失或不是真 bool"
     tid = d.get("thread_id")
@@ -307,14 +319,18 @@ def validate_session_state(d):
     if recovery is not None:
         if not isinstance(recovery, dict):
             return "recovery 不是 null/dict"
+        if d["recovered"] is not True:  # 钉①
+            return "recovery episode 在场但 recovered=false——组合自相矛盾"
         attempts = recovery.get("attempts")
         if type(attempts) is not int:  # type is int：bool 是 int 的子类，必须单独挡
             return "recovery.attempts 缺失或不是真 int"
-        if not 0 <= attempts <= MAX_FRESH_ATTEMPTS:
-            return f"recovery.attempts={attempts} 超出 0..{MAX_FRESH_ATTEMPTS}"
+        if not 1 <= attempts <= MAX_FRESH_ATTEMPTS:  # 钉②
+            return f"recovery.attempts={attempts} 超出 1..{MAX_FRESH_ATTEMPTS}"
         old_tid = recovery.get("old_tid")
         if old_tid is not None and not (isinstance(old_tid, str) and old_tid):
             return "recovery.old_tid 不是非空字符串"
+        if tid is None and old_tid is not None:  # 钉③
+            return "thread_id 为 null 时 recovery.old_tid 也必须 null"
     if tid is None and recovery is None:
         return "无名指针且没有 recovery episode——不是初次上岗，是坏文件"
     return None

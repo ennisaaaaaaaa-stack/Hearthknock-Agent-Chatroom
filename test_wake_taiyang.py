@@ -17,7 +17,9 @@
    不换指针、ghost 真签名保留、episode attempts 持久化与用尽、试住成功洗回；
    #299 P0 schema 校验反例：{} / thread_id:null / recovery 非 dict /
    attempts 越界或假 int / recovered 假 bool 全部 session_corrupt→4 不点火、
-   原文件不动；上岗中间态（thread_id:null + episode 进行中）是合法自己人不误杀
+   原文件不动；上岗中间态（thread_id:null + episode 进行中）是合法自己人不误杀；
+   #303 P0 组合钉：recovered=false+recovery / attempts=0 / null 指针+非空 old_tid
+   全 corrupt（伪健康指针不许跳过 resume 静默换身份）
 8. doorman l3_alert（#293 P1）：POST 失败不记 6h 账不落盘、可立即重试；
    成功才记账并原子落盘；6h 幂等不刷屏
 9. doorman 关房分支 wake 路由（#299 P1）：spawn_wake 必须带上 state，
@@ -469,6 +471,39 @@ with tempfile.TemporaryDirectory() as td7:
           rc == 0 and calls == ["fresh"]
           and sess == {"thread_id": "new1", "recovered": True},
           f"rc={rc} calls={calls} sess={sess}")
+
+    # ── #303 P0 组合洞反例（validate_session_state 三条组合钉）──
+    # 7p 太阳哥最小反例：recovery 在场但 recovered=false + attempts=0——旧版合法，
+    # 会跳过 resume 直接 fresh，静默换掉本来健康的指针。必须 exit=4、child 不启动、
+    # 原文件一个字节不动
+    counter = {"thread_id": "old", "recovered": False,
+               "recovery": {"old_tid": "old", "attempts": 0}}
+    rc, calls, _, raw = run_l2(td7, [], session_content=counter)
+    res = _json.loads((td7 / "sess.json.result.json").read_text(encoding="utf-8"))
+    check("7p #303 最小反例 → 4 不点火原文件不动",
+          rc == 4 and calls == [] and _json.loads(raw) == counter
+          and res.get("failure_class") == "session_corrupt",
+          f"rc={rc} calls={calls} raw={raw!r} res={res}")
+
+    # 7q 钉①单变量：recovered=false + 合法 episode（attempts=1）→ 组合自相矛盾
+    rc, calls, _, _ = run_l2(td7, [], session_content={
+        "thread_id": "old", "recovered": False,
+        "recovery": {"old_tid": "old", "attempts": 1}})
+    check("7q recovered=false+recovery → 4 不点火", rc == 4 and calls == [],
+          f"rc={rc} calls={calls}")
+
+    # 7r 钉②单变量：attempts=0（episode 落盘时一定已试过一次，0 是假账）→ 4
+    rc, calls, _, _ = run_l2(td7, [], session_content={
+        "thread_id": "old", "recovered": True,
+        "recovery": {"old_tid": "old", "attempts": 0}})
+    check("7r attempts=0 → 4 不点火", rc == 4 and calls == [], f"rc={rc} calls={calls}")
+
+    # 7s 钉③单变量：thread_id=null 但 old_tid 非 null（没签到家却有旧家）→ 4
+    rc, calls, _, _ = run_l2(td7, [], session_content={
+        "thread_id": None, "recovered": True,
+        "recovery": {"old_tid": "old", "attempts": 1}})
+    check("7s null 指针+非空 old_tid → 4 不点火", rc == 4 and calls == [],
+          f"rc={rc} calls={calls}")
 
 # --- 8. doorman l3_alert（太阳哥 #293 P1：POST 成功才记 6h 账 + 原子落盘） ---
 spec_dm = importlib.util.spec_from_file_location("doorman", BASE / "doorman.py")
