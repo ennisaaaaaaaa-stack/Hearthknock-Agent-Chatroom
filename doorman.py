@@ -2,6 +2,42 @@
 """
 门房 (doorman) v7 —— 客厅的门卫：有新消息就把对应 runtime 拉起来。
 
+v7.11（断线三件套 v1 + zhaozhao #1550 三刀，2026-11-15；病灶：patrol() 拉房间列表
+失败的 except 只 log 一行就 return——一个 except 吞掉了一万八千次超时，
+hearth死透期间门房夜夜空转，账本上看不出任何事发生过）：
+  - ① 失败形态分类：timeout / conn-refused / conn-reset / dns / http-<code>，
+    URLError 的 .reason 和本体两层都看；进报警也进断线账
+  - ② 计时挂「整轮巡逻零成功」（zhaozhao P1②）：拉名单挂、或本侧该巡的房
+    游标/消息全拉失败才算断线轮；部分成功只记形态不计入——服务端半死
+    （GET 通、单房挂）时 fetch_rooms 绿着照样全屋哑
+  - ③ 连续失败超阈值（blackout_spawn_after_sec，默认 24h）本地直接点火出声：
+    专用报警模板（zhaozhao P0——拿普通叫醒词，被叫的人醒来只会拉hearth空转，
+    报警白烧；summary_template 是同款先例）。spawn_wake 不签投递单绕过hearth、
+    不过 due() 节流（closing 分支同款先例），每次断线只点一次，点不进
+    （成员在飞）每小时重试一次
+  - ④ 自愈必留痕：断线账按「距上次成功巡逻」的跨度算（zhaozhao P1①——
+    flapping「断 23h59 + 成功 1 次 + 再断」报警永远凑不满 24h，但每次
+    恢复都留一笔账，形态至少可见）。补投进 blackout_report_room，
+    POST 成功才销账（l3_alert 先例）；失败次数聚合成数进账，不贴原始 log；
+    短于 blackout_report_after_sec（默认 10 分钟）的抖动只留本地日志。
+    补投连失败 200 轮弃账（防 report room 指去已关的房时无限重试刷日志，
+    弃账动作本身大声记日志）
+  - first_fail / last_success / last_alerted 全部随 state 原子落盘（zhaozhao点的
+    #293 P1 同款课）：门房 crash-loop 时内存计时反复清零，24h 永远凑不满
+  state 新增 "blackout"（None 或断线台账）和 "last_patrol_ok" 键；丢了从头
+  重记，方向安全：多报不少报
+
+v7.10.1（zhaozhao #631 点的日志措辞整改，2026-09-16）：
+  - 「没有无头入口」改口「本侧无头入口缺席」：联邦架构下无 cmd 成员由对端门房
+    自理（代码注释早写了，日志措辞没跟上），旧措辞把本侧 roster 的账读成全局
+    事实，分不清「对端自理」和「真没人管」。巡检账和关房挂账两处同改
+
+v7.10（zhaozhao #608 审稿料的整改，2026-09-15）：
+  - 房从名单消失时带走它的本地去重键：recovery_alerted 的 stale key 会压住
+    将来同名房真出事时的第一声报警（server 侧 delete 够不着门房本地 state）；
+    closing_notified 同款——同名续房进入关闭流程会被静默跳过。
+    只在拉名单成功后清，失败时绝不动（方向安全：宁可多留，不可误清）
+
 v7.9（太阳哥 #299 二轮的 P1 整改，2026-09-05）：
   - 关房分支 spawn_wake 补传 state：旧版漏传，admin 若是 wrapper 成员（太阳哥）
     且 exit=4，wake() 里 state is None，l3_alert 静默哑火——关房摘要的兜底链
@@ -23,7 +59,7 @@ v7.7（zhaozhao模板轮审的三条整改，2026-09-03）：
     JSON 示例必须 {{...}} 双大括号转义，渲染后才剩单层（见 doorman.json template_note）
   - 基础设施账号（门房/仵作）只在 agents 列表，不进 members：parse_mentions 只扫
     members，@ 它们匹配不到任何叫醒目标，自然落空；members 里挂 cmd:null 反而会
-    混进「没有无头入口」的巡检日志噪音。说明落在 doorman.json infra_accounts
+    混进「本侧无头入口缺席」的巡检日志噪音。说明落在 doorman.json infra_accounts
 
 v7（游标台账进hearth；太阳哥审 v6 两条 P0 的整改，2026-08-30）：
   - 游标从门房本地 state 文件迁进 server 的 cursors 表。state 文件丢了
@@ -101,7 +137,7 @@ v4/v5 沿用的规矩：
 户口: Chatroom-Autostart 计划任务每 5 分钟巡检，缺了会被重新拉起。
 """
 
-import json, os, subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request
+import json, os, socket, subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -178,6 +214,155 @@ def post_json(server, path, payload):
         headers={"Content-Type": "application/json"}, method="POST")
     with urllib.request.urlopen(req, timeout=10) as r:
         return json.loads(r.read().decode("utf-8"))
+
+
+def fmt_dur(sec):
+    """断线时长的人话格式：73s / 5m3s / 26h14m。"""
+    sec = int(sec)
+    if sec >= 3600:
+        return f"{sec // 3600}h{(sec % 3600) // 60}m"
+    if sec >= 60:
+        return f"{sec // 60}m{sec % 60}s"
+    return f"{sec}s"
+
+
+def classify_failure(e):
+    """三件套①失败形态分类：URLError 把真因包在 .reason 里，两层都要看。
+    断线的形状留在账上——「server 死了」（conn-refused）、「网络断了」（dns/
+    timeout）和「hearth回了错」（http-<code>）是三种不同的病，原先只剩一行裸异常。"""
+    if isinstance(e, urllib.error.HTTPError):
+        return f"http-{e.code}"
+    reason = getattr(e, "reason", None)
+    for c in ([e, reason] if reason is not None else [e]):
+        if isinstance(c, (TimeoutError, socket.timeout)):
+            return "timeout"
+        if isinstance(c, ConnectionRefusedError):
+            return "conn-refused"
+        if isinstance(c, ConnectionResetError):
+            return "conn-reset"
+        if isinstance(c, socket.gaierror):
+            return "dns"
+    return type(e).__name__
+
+
+def _forms_text(forms):
+    return "、".join(f"{k}×{v}" for k, v in sorted(forms.items(), key=lambda kv: -kv[1])) or "无记录"
+
+
+# v7.11 断线报警的专用叫醒模板（zhaozhao #1550 P0：拿普通叫醒词，被叫的成员醒来
+# 第一件事是拉hearth→拉不到→空转退出，报警白烧）。closing 的 summary_template
+# 是同款先例：特殊任务配特殊模板。配置里可用 blackout_template 覆盖。
+# 模板字段：member/room/server/dur/span/count/forms/last_error——
+# 正文没有 JSON 示例，不涉及双大括号转义（template_note 的双轨规矩）。
+DEFAULT_BLACKOUT_TEMPLATE = (
+    "[门房·链路报警] 这不是新消息叫醒——门房→hearth的链路断了，门房绕过hearth本地直接点的火。\n"
+    "- hearth（{server}）已连续 {dur} 拉不通（零成功巡逻 {count} 轮，形态：{forms}，最近错误：{last_error}），"
+    "距上次成功巡逻已 {span}。\n"
+    "- hearth不可达是已知事实：不要去拉消息、不要等消息——拉不到不是新情况。\n"
+    "- 你的任务是诊断链路本身：hearth server 进程活没活、本机网络/代理/Tailscale 通不通"
+    "（前科：tailscaled 僵死成双进程，链路断 11 天一万八千次超时没人知道——这次报警就是为此装的）。\n"
+    "- 处理完不用回hearth（不可达时发不出去）；门房自愈后会把断线账补投进hearth留痕。\n"
+    "你是{member}，被门房的断线哨兵叫醒的。"
+)
+
+
+def blackout_spawn_voice(cfg, state, bo, now):
+    """三件套③本地出声：连续失败超阈值后，门房绕过hearth直接把本侧成员叫起来
+    （spawn_wake 不签投递单、不碰台账、不过 due() 节流，走专用报警模板）。
+    每次断线只点一次；点不进（成员在飞）每小时重试一次（last_alerted 随 state
+    落盘，crash-loop 不会把重试计时清零）。没有可点火的成员就只留日志账。"""
+    if bo.get("last_alerted") and now - bo["last_alerted"] < 3600:
+        return
+    bo["last_alerted"] = now
+    member = cfg.get("blackout_notify_member")
+    if not member:
+        member = next((m for m, s in cfg["members"].items() if s.get("cmd")), None)
+    spec = cfg["members"].get(member) if member else None
+    if not spec or not spec.get("cmd"):
+        log(f"⚠ 断线超阈值但本侧没有可点火的成员（blackout_notify_member={member!r}）——只留日志账")
+        bo["alerted"] = True
+        return
+    info = {
+        "dur": fmt_dur(now - bo["first_fail"]),
+        "span": fmt_dur(now - bo["last_success"]),
+        "count": bo["count"],
+        "forms": _forms_text(bo["forms"]),
+        "last_error": bo["last_error"],
+    }
+    room = cfg.get("blackout_report_room") or (cfg.get("rooms") or ["（hearth不可达）"])[0]
+    log(f"⚠ 连续失败超阈值（{info['dur']}），本地点火 {member} 出声（专用报警模板）")
+    bo["alerted"] = bool(spawn_wake(member, room, blackout=info, cfg=cfg, state=state))
+
+
+def blackout_round_failed(cfg, state, forms, last_error, now, dirty):
+    """整轮零成功（拉房间列表挂，或本侧该巡的房全拉失败）→ 断线台账。
+    zhaozhao #1550 P1②：计时挂「整轮巡逻零成功」上——拉游标/巡房失败和拉名单
+    失败是同一个吞法的兄弟路径，服务端半死时 fetch_rooms 绿着照样全屋哑。
+    first_fail（连续失败计时，成功即重置）驱动报警；last_success（距上次成功
+    巡逻）驱动断线账跨度——两个时刻都随 state 落盘（#293 P1 同款课：门房
+    crash-loop 时内存计时反复清零，24h 永远凑不满）。
+    返回 True（state 必变，触发落盘）。"""
+    bo = state.get("blackout")
+    if not bo:
+        bo = state["blackout"] = {
+            "last_success": state.get("last_patrol_ok") or now,
+            "first_fail": now, "count": 0, "forms": {},
+            "last_error": "", "alerted": False, "last_alerted": 0,
+            "ledger_attempts": 0}
+        log(f"⚠ hearth断线起账（整轮零成功，形态 {_forms_text(dict((f, 1) for f in forms))}）: {last_error}")
+    else:
+        log(f"整轮零成功（断线已 {fmt_dur(now - bo['first_fail'])}，第 {bo['count'] + 1} 轮，"
+            f"形态 {_forms_text(dict((f, 1) for f in forms))}）: {last_error}")
+    bo["count"] += 1
+    for f in forms:
+        bo["forms"][f] = bo["forms"].get(f, 0) + 1
+    bo["last_error"] = str(last_error)[:200]
+    if not bo["alerted"] and now - bo["first_fail"] >= cfg.get("blackout_spawn_after_sec", 24 * 3600):
+        blackout_spawn_voice(cfg, state, bo, now)
+    return True
+
+
+def blackout_round_ok(cfg, state, partial_forms, now, dirty):
+    """整轮有成功（含部分成功）：部分成功轮里见过的失败形态只记不计入
+    （zhaozhao #1550 P1②——计时只挂零成功轮）。有未销的断线账 = 自愈了：
+    三件套④断线账按「距上次成功巡逻」的跨度补投进 blackout_report_room，
+    POST 成功才销账（l3_alert 先例），失败下轮再试；失败次数聚合成数进账，
+    不贴原始 log。短于 blackout_report_after_sec（默认 10 分钟）的抖动只留
+    本地日志。补投连失败 200 轮弃账（防 report room 指去已关的房——server
+    对非 open 房一律 409——时无限重试刷日志，弃账动作本身大声记日志）。"""
+    state["last_patrol_ok"] = now  # 每轮必写：crash-loop 也不能让计时器清零
+    bo = state.get("blackout")
+    if not bo:
+        return True
+    for f in partial_forms:
+        bo["forms"][f] = bo["forms"].get(f, 0) + 1
+    span = now - bo["last_success"]
+    dur = fmt_dur(span)
+    room = cfg.get("blackout_report_room") or (cfg.get("rooms") or [None])[0]
+    if span < cfg.get("blackout_report_after_sec", 600):
+        log(f"✔ 断线自愈（跨度 {dur}，{bo['count']} 轮）——短于补投阈值，账只留本地日志")
+    elif room:
+        text = (f"[门房·断线账] hearth曾不可达 {dur}"
+                f"（{datetime.fromtimestamp(bo['last_success']).strftime('%m-%d %H:%M')} 上次成功巡逻起，"
+                f"其中连续失败 {fmt_dur(now - bo['first_fail'])}、零成功巡逻 {bo['count']} 轮，"
+                f"形态：{_forms_text(bo['forms'])}）。"
+                f"期间门房巡逻空转、消息未投递，现已自愈——此账为自愈后补投留痕。")
+        try:
+            post_json(cfg["server"], "/api/send", {"room": room, "sender": "门房", "text": text})
+            log(f"✔ 断线账已补投进「{room}」（跨度 {dur}，{bo['count']} 轮）")
+        except Exception as e:
+            bo["ledger_attempts"] = bo.get("ledger_attempts", 0) + 1
+            if bo["ledger_attempts"] >= 200:
+                log(f"⛔ 断线账补投连失败 200 轮，弃账（跨度 {dur}，{bo['count']} 轮，形态 "
+                    f"{_forms_text(bo['forms'])}）——blackout_report_room（{room}）是否指向活房？")
+                state["blackout"] = None
+                return True
+            log(f"断线账补投失败（第 {bo['ledger_attempts']} 次，hearth刚恢复，下轮再试）: {e}")
+            return True  # 不清账（ledger_attempts 变了也要落盘），下轮再试
+    else:
+        log(f"✔ 断线自愈（{dur}，{bo['count']} 轮）——未配置 blackout_report_room，账只留本地日志")
+    state["blackout"] = None
+    return True
 
 
 def prepare_delivery(cfg, room, member, upto, kind="wake"):
@@ -272,10 +457,15 @@ def parse_mentions(text, cfg):
     return hits
 
 
-def build_prompt(cfg, member, room, msgs=None, closing=False, overflow=0):
+def build_prompt(cfg, member, room, msgs=None, closing=False, overflow=0, blackout=None):
     spec = cfg["members"][member]
     server = spec.get("server") or cfg["server"]
-    if closing:
+    if blackout is not None:
+        # 断线报警（v7.11 zhaozhao #1550 P0）：专用模板，明说「这是链路报警不是
+        # 新消息」——拿普通叫醒词，被叫的人醒来只会拉hearth空转，报警白烧
+        tpl = cfg.get("blackout_template") or DEFAULT_BLACKOUT_TEMPLATE
+        prompt = tpl.format(member=member, room=room, server=server, **blackout)
+    elif closing:
         prompt = cfg["summary_template"].format(member=member, room=room, server=server)
     else:
         lines = []
@@ -332,17 +522,17 @@ def l3_alert(cfg, state, member, room):
     log(f"L3 报警已发到「{room}」@tiexin（{member} exit=4）")
 
 
-def wake_once(cfg, member, room, msgs=None, closing=False, overflow=0):
+def wake_once(cfg, member, room, msgs=None, closing=False, overflow=0, blackout=None):
     """叫醒一次。返回被叫进程的 exit code；只有 0 主流程才敢 ack 落游标
     （at-least-once 的确认）。4 = wrapper 的 L2 兜底链断到头（交 L3 报警）；
     -1 超时 / -2 点火异常。"""
     spec = cfg["members"][member]
-    prompt = build_prompt(cfg, member, room, msgs, closing, overflow)
+    prompt = build_prompt(cfg, member, room, msgs, closing, overflow, blackout)
     # prompt 同时落一份文件：WSL/跨机入口走 {prompt_file} 免引号转义
     pf = BASE / f".doorman-prompt-{member}.txt"
     pf.write_text(prompt, encoding="utf-8")
     cmd = [s.format(prompt=prompt, prompt_file=str(pf), room=room) for s in spec["cmd"]]
-    what = "关房摘要" if closing else f"{len(msgs)} 条"
+    what = "断线报警" if blackout is not None else ("关房摘要" if closing else f"{len(msgs)} 条")
     log(f"叫醒 {member}（房间「{room}」，{what}）")
     try:
         # 被叫醒的是控制台程序（kimi.exe / wsl.exe），不加 CREATE_NO_WINDOW
@@ -367,14 +557,15 @@ def wake_once(cfg, member, room, msgs=None, closing=False, overflow=0):
         return -2
 
 
-def wake(cfg, member, room, delivery_id, msgs=None, closing=False, overflow=0, state=None):
+def wake(cfg, member, room, delivery_id, msgs=None, closing=False, overflow=0, state=None,
+         blackout=None):
     # 同一成员一次只跑一个进程。用户连续发消息时，新唤醒排队等上一轮结束，
     # 避免两个进程同时 resume 同一个会话。
     key = (member, room)
     try:
         lock = WAKE_LOCKS.setdefault(member, threading.Lock())
         with lock:
-            rc = wake_once(cfg, member, room, msgs, closing, overflow)
+            rc = wake_once(cfg, member, room, msgs, closing, overflow, blackout)
         if rc == 0 and delivery_id:
             # at-least-once 的 ack：归位才向台账确认投递单；确认前崩溃顶多重投，不会漏
             ack_cursor(cfg, room, member, delivery_id)
@@ -386,11 +577,13 @@ def wake(cfg, member, room, delivery_id, msgs=None, closing=False, overflow=0, s
 
 
 def spawn_wake(member, room, upto=None, msgs=None, closing=False, overflow=0, cfg=None,
-               state=None):
+               state=None, blackout=None):
     """点火前两道闸：一，同一 (member,room) 已有进程在飞就不重复点火——
     慢叫醒（冷启动约 1 分钟）期间巡逻照常转，新消息攒着，落地 ack 后下轮一起送；
     二，要落游标的叫醒先向hearth签发投递单（ack 只认签发过的单）——
-    签发放在 IN_FLIGHT 占位之后，被拒/失败不点火也不留废单。"""
+    签发放在 IN_FLIGHT 占位之后，被拒/失败不点火也不留废单。
+    blackout（v7.11 断线报警）走 upto=None 不签单、不过 due() 节流——
+    hearth不可达时签单无门，报警必须绕过断掉的那条腿（closing 分支同款先例）。"""
     key = (member, room)
     with IN_FLIGHT_LOCK:
         if key in IN_FLIGHT:
@@ -407,7 +600,7 @@ def spawn_wake(member, room, upto=None, msgs=None, closing=False, overflow=0, cf
     threading.Thread(target=wake, kwargs={"cfg": cfg, "member": member, "room": room,
                                           "delivery_id": delivery_id, "msgs": msgs,
                                           "closing": closing, "overflow": overflow,
-                                          "state": state},
+                                          "state": state, "blackout": blackout},
                      daemon=True, name=f"wake-{member}").start()
     return True
 
@@ -424,19 +617,41 @@ def due(state, member, cfg, now):
 def patrol(cfg, agents, state, now):
     """巡一轮所有房。返回是否有状态变更。任何单个房间的错都不该炸掉整轮。
     游标台账在 server 端：门房本地 state 只剩节流记录和报警去重，
-    state 文件丢失的最坏结果是多叫几轮——永远不会表现为「失忆装初来乍到」。"""
+    state 文件丢失的最坏结果是多叫几轮——永远不会表现为「失忆装初来乍到」。
+    v7.11：整轮巡逻零成功（拉名单挂，或本侧该巡的房全拉失败）进断线台账——
+    一个 except 吞掉一万八千次超时的病，从这条线治。"""
     dirty = False
     try:
         rooms = fetch_rooms(cfg["server"])
     except Exception as e:
         log(f"拉房间列表失败: {e}")
-        return False
+        return blackout_round_failed(cfg, state, [classify_failure(e)], e, now, dirty)
+    # 房从名单消失（被删）就带走它的本地去重键（zhaozhao #608 审稿料）：
+    # recovery_alerted 的 stale key 会压住将来同名房真出事时的第一声报警；
+    # closing_notified 同款——同名续房进入关闭流程会被静默跳过。
+    # 只在拉名单成功后清，失败时绝不动（方向安全：宁可多留，不可误清）。
+    live = {r["room"] for r in rooms}
+    for k in ("recovery_alerted", "closing_notified"):
+        old = state.get(k)
+        if old is None:
+            continue  # 手工搭的最小 state（测试）可能没这对键——丢了从头重记，方向安全
+        kept = [x for x in old if x.split("|", 1)[0] in live]
+        if len(kept) != len(old):
+            log(f"清理 {len(old) - len(kept)} 条已删除房间的 {k} 键: "
+                f"{[x for x in old if x not in kept]}")
+            state[k] = kept
+            dirty = True
+    # 整轮成败计数（v7.11 zhaozhao #1550 P1②）：本侧该巡的 open 房里，游标+消息
+    # 都拉通才算成功；全灭 = 零成功轮进断线台账，部分成功只记形态不计入
+    attempted = 0        # 本侧该巡的 open 房（有服役成员）
+    completed = 0        # 其中拉通的
+    partial_forms = []   # 拉失败的房的形态分布（只记不计入）
     for r in rooms:
         room, members, rstate = r["room"], r["members"], r["state"]
         if rstate == "closed" or r.get("archived"):
             continue
         if rstate == "closing":
-            # 每个房只通知一次；admin 没配无头入口就记账等人来救
+            # 每个房只通知一次；admin 本侧没配无头入口就记账等人来救
             if room in state["closing_notified"]:
                 continue
             admin = r["admin"] or "mingming"
@@ -449,22 +664,27 @@ def patrol(cfg, agents, state, now):
             else:
                 state["closing_notified"].append(room)
                 dirty = True
-                log(f"「{room}」进入关闭流程，但管理员 {admin} 没有无头入口，挂了账")
+                log(f"「{room}」进入关闭流程，管理员 {admin} 本侧无头入口缺席，挂了账（对端门房可能已送达）")
             continue
+        # 只为自己服务的成员（cmd 非空）拉窗：无 cmd 成员由对端门房自理，
+        # 本地不扫他们的窗、更不动他们的行（v6 代推游标 = 替别人丢信）
+        served = [m for m, s in cfg["members"].items() if s.get("cmd")]
+        if served:
+            attempted += 1
         # open 房：从hearth台账拉游标
         try:
             cmap = fetch_cursors(cfg["server"], room)
         except Exception as e:
             log(f"拉「{room}」游标台账失败: {e}")
+            partial_forms.append(classify_failure(e))
             continue
         if not cmap:
             # 新房创建时必落行（open_ledger）；整房无行 = 台账丢失，报警不猜
+            if served:
+                completed += 1  # 链路是通的（空表是数据事故不是断线，下面报警）
             dirty |= alert_recovery(state, room, "*",
                                     "整房没有任何 cursor 行——按台账丢失处理，本房跳过，等管理员 recover")
             continue
-        # 只为自己服务的成员（cmd 非空）拉窗：无 cmd 成员由对端门房自理，
-        # 本地不扫他们的窗、更不动他们的行（v6 代推游标 = 替别人丢信）
-        served = [m for m, s in cfg["members"].items() if s.get("cmd")]
         if not served:
             continue
         rows = {m: cmap.get(m) for m in served}
@@ -483,13 +703,16 @@ def patrol(cfg, agents, state, now):
                 dirty |= clear_recovery(state, room, m)
         ok_rows = [r for r in rows.values() if r]
         if not ok_rows:
+            completed += 1  # 链路是通的（全员缺行是数据事故，上面已逐成员报警）
             continue  # 全员缺行：上面已逐成员报警，本轮不送
         since = min(r["cursor"] for r in ok_rows)
         try:
             d = fetch_messages(cfg["server"], room, since)
         except Exception as e:
             log(f"巡「{room}」失败: {e}")
+            partial_forms.append(classify_failure(e))
             continue
+        completed += 1
         msgs = d["messages"]
         if not msgs:
             continue
@@ -516,7 +739,7 @@ def patrol(cfg, agents, state, now):
         missing = [m for m, s in cfg["members"].items()
                    if not s.get("cmd") and (not members or m in members)]
         if human_any and missing:
-            log(f"（{room}）{'、'.join(missing)} 没有无头入口，人类发言送不到他们")
+            log(f"（{room}）{'、'.join(missing)} 本侧无头入口缺席（联邦下由对端门房自理），人类发言本侧送不到")
         for member in served:
             spec = cfg["members"][member]
             row = rows[member]
@@ -550,7 +773,12 @@ def patrol(cfg, agents, state, now):
             # 并行叫醒：一个成员慢（冷启动约 1 分钟）不挡别人的门铃
             spawn_wake(member, room, upto=deliver[-1]["id"], msgs=deliver,
                        overflow=overflow, cfg=cfg, state=state)
-    return dirty
+    # 整轮判定（v7.11 zhaozhao #1550 P1②）：该巡的房全军覆没 = 零成功轮进断线台账；
+    # 部分成功只记形态不计入；没有该巡的房 = hearth通着但没活干，算成功轮。
+    if attempted and not completed:
+        return blackout_round_failed(cfg, state, partial_forms or ["unknown"],
+                                     f"{attempted} 房该巡全部拉取失败", now, dirty)
+    return blackout_round_ok(cfg, state, partial_forms, now, dirty)
 
 
 def migration_gate(cfg):
@@ -580,14 +808,19 @@ def main():
     # v7 起 state 只剩：节流记录（last_wake/wake_log）、关房通知去重、报警去重。
     # 游标在hearth台账（server 端 cursors 表）——这个文件整个丢了也不丢信。
     state = {"last_wake": {}, "wake_log": {}, "closing_notified": [], "recovery_alerted": [],
-             "l3_alerted": {}}
+             "l3_alerted": {}, "blackout": None, "last_patrol_ok": None}
     if STATE_FILE.exists():
         state.update(json.loads(STATE_FILE.read_text(encoding="utf-8")))
     for k in ("last_wake", "wake_log", "closing_notified", "recovery_alerted", "l3_alerted"):
         state.setdefault(k, {} if k in ("last_wake", "wake_log", "l3_alerted") else [])
+    # v7.11 断线台账：None 或 {last_success,first_fail,count,forms,last_error,
+    # alerted,last_alerted,ledger_attempts}；last_patrol_ok = 上次成功巡逻时刻。
+    # 两个时刻都落盘（zhaozhao #1550 点的 #293 P1 同款课）——crash-loop 清零不了
+    state.setdefault("blackout", None)
+    state.setdefault("last_patrol_ok", None)
     state.pop("cursors", None)  # v6 遗存：游标已由 migrate_cursors_v7.py 迁进hearth台账，本地这份从此作废
 
-    log(f"门房 v7.9 上岗（游标台账在hearth，写游标 = prepare 签发投递单 + ack 确认单），房间动态从 server 拉取，每 {cfg['poll_seconds']}s 巡一次")
+    log(f"门房 v7.11 上岗（断线三件套：形态分类/零成功计时/超时本地模板点火/自愈补投断线账；游标台账在hearth，写游标 = prepare 签发投递单 + ack 确认单），房间动态从 server 拉取，每 {cfg['poll_seconds']}s 巡一次")
     while True:
         now = time.time()
         # 心跳是看门人的命：进程活着但循环死了（僵尸）这件事已经发生过。
