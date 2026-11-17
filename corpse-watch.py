@@ -28,6 +28,7 @@ v1 只验 kimi-code 的 session（~/.kimi-code/sessions/）。zhaozhao（Hermes�
 """
 
 import json
+import os
 import sys
 import time
 import urllib.request
@@ -51,7 +52,11 @@ ESCALATE_WINDOW_HOURS = 6  # L3 升级幂等窗：同房同窗内只 @tiexin 一
 KIMI = Path.home() / ".kimi-code" / "bin" / "kimi.exe"
 DOORMAN_MARK = "[客厅·门房叫醒"   # wire 开头带它 = 这具尸体是门房叫醒的差事
 RELAY_MARK = "[仵作·接力"         # 接力 session 的尸体只报丧不再接力——防丧葬流水线
-DEFAULT_CWD = Path(r"C:\Users\<winuser>\Documents\kimi\workspace\tideline-memory")
+# 接力 spawn 的工作目录：env 覆盖优先，缺省取本脚本所在仓的兄弟目录 tideline-memory。
+DEFAULT_CWD = Path(os.environ.get(
+    "CORPSE_WATCH_CWD",
+    Path(__file__).resolve().parent.parent / "tideline-memory",
+))
 
 # 停在这些工具上不算死：是在等人/等外部条件，不是暴毙
 WAITING_TOOLS = {"AskUserQuestion"}

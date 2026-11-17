@@ -5,8 +5,11 @@
 # a backtick that silently eats the next line. The family has been bitten. Twice.
 
 $ErrorActionPreference = "Continue"
-$root = "C:\Users\<winuser>\Documents\kimi\workspace\chatroom"
-$pyw  = "C:\Users\<winuser>\AppData\Local\Programs\Python\Python314\pythonw.exe"
+# Paths: env override first, then derive from this script's own location.
+# CHATROOM_ROOT = chatroom dir (default: the dir this script lives in).
+# CHATROOM_PYW  = pythonw.exe (default: whatever pythonw.exe is on PATH).
+$root = if ($env:CHATROOM_ROOT) { $env:CHATROOM_ROOT } else { $PSScriptRoot }
+$pyw  = if ($env:CHATROOM_PYW)  { $env:CHATROOM_PYW }  else { (Get-Command pythonw.exe -ErrorAction SilentlyContinue).Source }
 $logFile = Join-Path $root "chatroom-service.log"
 $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"

@@ -5,8 +5,11 @@
 
 $ps = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
 $wscript = "C:\Windows\System32\wscript.exe"
-$vbs = "C:\Users\<winuser>\Documents\kimi\workspace\tideline-memory\kimi-code\run-hidden.vbs"
-$launcher = "C:\Users\<winuser>\Documents\kimi\workspace\chatroom\chatroom-service.ps1"
+# Paths: env override first, then derive from this script's own location.
+# RUN_HIDDEN_VBS       = run-hidden.vbs (default: sibling tideline-memory repo).
+# CHATROOM_SERVICE_PS1 = chatroom-service.ps1 (default: next to this script).
+$vbs = if ($env:RUN_HIDDEN_VBS) { $env:RUN_HIDDEN_VBS } else { Join-Path (Split-Path $PSScriptRoot -Parent) "tideline-memory\kimi-code\run-hidden.vbs" }
+$launcher = if ($env:CHATROOM_SERVICE_PS1) { $env:CHATROOM_SERVICE_PS1 } else { Join-Path $PSScriptRoot "chatroom-service.ps1" }
 
 # Route through wscript + run-hidden.vbs: launching powershell.exe directly from
 # an interactive-task action flashes a console window every 5 minutes.
